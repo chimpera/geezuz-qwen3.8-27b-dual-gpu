@@ -1,3 +1,23 @@
+# multigpu-megakernel
+
+Multi-GPU (tensor-parallel) CUDA megakernel for Qwen3.8-27B GGUF with on-device MTP speculative decoding.
+
+## Origin and license
+
+This is a modified version of the single-GPU megakernel in
+[L-Forster/open-jet](https://github.com/L-Forster/open-jet) (`megakernel/` at commit `2993f47`),
+licensed under the GNU Affero General Public License v3.0 (see `LICENSE`). This repository is
+distributed under the same license.
+
+Modifications (2026-10-11): upstream's `megakernel/` directory moved to the repository root, with
+its git history. Planned: tensor parallelism across two GPUs over PCIe P2P, and Q5_K / Q6_K / Q8_0
+GGUF support.
+
+The sections below are upstream's README. References to `openjet setup`, `../docs` and
+`cd megakernel` apply to the upstream project; here the sources are at the root.
+
+---
+
 # Qwen3.8-27B megakernel (RTX 30/40/50 series)
 
 A specialised CUDA inference engine for `Qwen3.8-27B-Q4_K_M.gguf` (llama.cpp arch `qwen35`:
