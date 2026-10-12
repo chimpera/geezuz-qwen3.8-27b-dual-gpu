@@ -22,9 +22,14 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <condition_variable>
 #include <cstring>
+#include <exception>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <thread>
 #include <vector>
 
@@ -41,6 +46,11 @@
             exit(1);                                                                            \
         }                                                                                       \
     } while (0)
+
+#ifndef MK_TP
+#define MK_TP 1
+#endif
+static_assert(MK_TP == 1 || MK_TP == 2);
 
 namespace {
 
@@ -61,6 +71,18 @@ constexpr int DV_EXTRA = 4096;  // draft-vocabulary rows reserved for tokens of 
 constexpr int AB_SPLIT = 4;     // K-chunks per delta-net alpha/beta row
 constexpr int U_D = D / 32, U_FF = FF / 32, U_VD = VD / 32, U_EH = 2 * D / 32;
 constexpr int UMAX = U_FF;
+// per-card dims: TP=1 equals the full values; TP=2 halves, except FF padded 8704 -> 9216 (272 units not a multiple of 32)
+constexpr int NH_L = NH / MK_TP, NKV_L = NKV / MK_TP;
+constexpr int NKH_L = NKH / MK_TP, NVH_L = NVH / MK_TP;
+constexpr int QKV_L = QKV / MK_TP, VD_L = VD / MK_TP, QG_L = QG / MK_TP, KVD_L = KVD / MK_TP;
+constexpr int KVGB_V_L = NKH_L * HK, KVGB_G_L = KVGB_V_L + NVH_L * HK, KVGB_B_L = KVGB_G_L + NVH_L;
+constexpr int KVGB_L = KVGB_B_L + NVH_L;
+constexpr int FF_L = (MK_TP == 2) ? 9216 : FF;
+constexpr int VOCAB_L = VOCAB / MK_TP;
+constexpr int U_VD_L = VD_L / 32, U_FF_L = FF_L / 32, U_EH_L = U_EH / MK_TP;
+static_assert((U_VD_L % 32) == 0 && (U_FF_L % 32) == 0 && (U_EH_L % 32) == 0);
+static_assert((QG_L % 128) == 0 && (KVD_L % 128) == 0 && (QKV_L % 128) == 0);
+static_assert((VD_L % 128) == 0 && (FF_L % 128) == 0 && (VOCAB_L % 128) == 0);
 
 constexpr int AR = 6 * MAXT;   // attention query rows per kv head (6 q heads x tokens)
 constexpr int SM_XU = 4 * UMAX; // activation units (x tokens) shared memory holds; T = 5 ffn_down fills in two halves
@@ -106,6 +128,8 @@ struct ModelW {
     const int * draft_ids; // row -> token id for head_d (nullptr: identity)
     const float *enorm, *hnorm, *shnorm, *onorm;
     const uint8_t * embd;
+    int embd_type; // raw GGUF type of one embedding row, with its row bytes (embd_rb)
+    int embd_rb;
 };
 
 // Quantised activation vector(s) in the "unit" layout consumed by the GEMV:
@@ -152,6 +176,17 @@ struct Bufs {
     Ctl * ctl;
     unsigned long long * prof; // optional per-barrier timestamps (block 0)
     int ctx;
+#if MK_TP > 1
+    int rank;              // this card's tensor-parallel rank
+    float * xr[2];         // own reduce receive buffers [D/32 items][MAXT*32], double-buffered by k
+    unsigned * fl;         // own per-item reduce flags
+    float * peer_xr[2];    // peer's reduce receive buffers, P2P-mapped
+    unsigned * peer_fl;    // peer's per-item reduce flags
+    float2 * lx;           // lm_head exchange slot [MAXT*TOPK_MAX] float2
+    unsigned * lfl;        // lm_head exchange flag
+    float2 * peer_lx;      // peer's lm_head exchange slot, P2P-mapped
+    unsigned * peer_lfl;   // peer's lm_head exchange flag
+#endif
 };
 
 __constant__ ModelW cW;
@@ -164,8 +199,14 @@ struct Launch {
     float temp, top_p, min_p;
     int top_k; // <= TOPK_MAX
     unsigned long long seed;
+#if MK_TP > 1
+    unsigned gen; // host bumps per launch; folded into the cross-GPU flag tags
+#endif
 };
 constexpr int TOPK_MAX = 32; // candidates kept per main lm_head row when sampling
+#if MK_TP > 1
+__constant__ Launch L; // host writes gen each launch
+#endif
 
 // ------------------------------------------------------------------------------------------
 // small device helpers
@@ -259,6 +300,49 @@ __device__ __forceinline__ void gsync(unsigned & epoch, int tag) {
     }
     __syncthreads();
 }
+
+#if MK_TP > 1
+// Cross-GPU reduce/flag primitives. Flags are never reset per launch: the tag embeds Launch.gen,
+// so a stale flag from an earlier launch simply has an old gen and is not accepted.
+__device__ __forceinline__ unsigned tag_of(int k) {
+    // k is the reduction index within a launch; keep k < 4096 (1<<12) so it fits the low 12 bits
+    return (L.gen << 12) | (unsigned) k;
+}
+// The peer may already have sent its next reduction on this flag (it only needs my data, sent
+// before I wait), so a later tag also means mine arrived; the signed difference survives wrap.
+__device__ __forceinline__ bool tag_reached(unsigned v, unsigned t) { return (int) (v - t) >= 0; }
+__device__ __forceinline__ void flag_release_sys(unsigned * p, unsigned v) {
+    asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
+}
+__device__ __forceinline__ unsigned flag_acquire_sys(const unsigned * p) {
+    unsigned v;
+    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+// send this block's partial for item j to the peer, then release the peer's flag j
+__device__ __forceinline__ void xr_put(int j, int k, const float * part, int n) {
+    float * dst = cB.peer_xr[k & 1] + j * MAXT * 32;
+    for (int i = threadIdx.x; i < n; i += NT) dst[i] = part[i];
+    __syncthreads();
+    if (threadIdx.x == 0) { __threadfence_system(); flag_release_sys(cB.peer_fl + j, tag_of(k)); }
+}
+// wait for the peer's partial for item j to arrive; the caller then reads cB.xr[k & 1] + j*MAXT*32
+__device__ __forceinline__ void xr_wait(int j, int k) {
+    if (threadIdx.x == 0) while (!tag_reached(flag_acquire_sys(cB.fl + j), tag_of(k))) __nanosleep(32);
+    __syncthreads();
+}
+// same send/flag exchange for the single lm_head slot
+__device__ __forceinline__ void lx_put(int k, const float2 * part, int n) {
+    float2 * dst = cB.peer_lx;
+    for (int i = threadIdx.x; i < n; i += NT) dst[i] = part[i];
+    __syncthreads();
+    if (threadIdx.x == 0) { __threadfence_system(); flag_release_sys(cB.peer_lfl, tag_of(k)); }
+}
+__device__ __forceinline__ void lx_wait(int k) {
+    if (threadIdx.x == 0) while (!tag_reached(flag_acquire_sys(cB.lfl), tag_of(k))) __nanosleep(32);
+    __syncthreads();
+}
+#endif
 
 // profiling: timestamp the end of a phase's activation fill (block 0)
 __device__ __forceinline__ void mark_fill() {
@@ -584,6 +668,16 @@ template <int TYPE>
 __device__ __forceinline__ int unit_bytes(int u0) {
     return TYPE == T_Q4K ? (u0 >> 3) * 144 : TYPE == T_Q5K ? (u0 >> 3) * 176 : TYPE == T_Q6K ? (u0 >> 3) * Q6_BLK : 32 * u0;
 }
+// One entry for the per-type row decoders; dp (Q8_0 scales) unused for the other types.
+template <int T, int IT, int R, int TYPE>
+__device__ __forceinline__ void rows_any(const uint8_t * const (&rp)[R], const __half * const (&dp)[R],
+                                         const SX & s, float (&acc)[R][T]) {
+    if constexpr (TYPE == T_Q4K) rows_q4k<T, IT, R>(rp, s, acc);
+    else if constexpr (TYPE == T_Q5K) rows_q5k<T, IT, R>(rp, s, acc);
+    else if constexpr (TYPE == T_Q6K) rows_q6k<T, IT, R>(rp, s, acc);
+    else rows_q80<T, IT, R>(rp, dp, s, acc);
+}
+
 template <int T, int IT, int R, int TYPE>
 __device__ __forceinline__ void mrows(const Mat & m, int row0, const SX & s, float (&acc)[R][T], int u0 = 0) {
     const uint8_t * rp[R];
@@ -593,36 +687,63 @@ __device__ __forceinline__ void mrows(const Mat & m, int row0, const SX & s, flo
         rp[k] = m.w + (size_t) (row0 + k) * m.rb + unit_bytes<TYPE>(u0);
         dp[k] = m.d + (size_t) (row0 + k) * m.nd + u0;
     }
-    if constexpr (TYPE == T_Q4K) rows_q4k<T, IT, R>(rp, s, acc);
-    else if constexpr (TYPE == T_Q5K) rows_q5k<T, IT, R>(rp, s, acc);
-    else if constexpr (TYPE == T_Q6K) rows_q6k<T, IT, R>(rp, s, acc);
-    else rows_q80<T, IT, R>(rp, dp, s, acc);
+    rows_any<T, IT, R, TYPE>(rp, dp, s, acc);
 }
 
-// Row pairs [lo, hi) of a single-matrix item range, distributed over all warps of the grid.
-// out(row0, acc) receives the reduced sums for rows row0, row0 + 1.
+// Noinline so the type switch's register cost stays out of the callers (cf. gemv_pairs_t).
+template <int T, int IT, int R>
+__device__ __noinline__ void mrows_t(int type, const Mat & m, int row0, const SX & s, float (&acc)[R][T], int u0 = 0) {
+    switch (type) {
+    case T_Q4K: mrows<T, IT, R, T_Q4K>(m, row0, s, acc, u0); break;
+    case T_Q5K: mrows<T, IT, R, T_Q5K>(m, row0, s, acc, u0); break;
+    case T_Q6K: mrows<T, IT, R, T_Q6K>(m, row0, s, acc, u0); break;
+    default: mrows<T, IT, R, T_Q8_0>(m, row0, s, acc, u0); break;
+    }
+}
+
+// Row pairs [lo, hi) of a single-matrix item range, distributed over all warps of the grid; tot
+// ends the phase's whole item chain.  out(row0, acc, nr) receives the reduced sums for rows
+// row0 .. row0 + nr - 1 (nr 1 or 2).
 template <int T, int IT, int TYPE, class Out>
-__device__ __noinline__ void gemv_pairs(const Mat m, int lo, int hi, Out out) {
+__device__ __noinline__ void gemv_pairs(const Mat m, int lo, int hi, int tot, Out out) {
     const SX sx = make_sx(nullptr, 32 * IT); // activations already in shared memory
     const int W = nwarps(), gw = gwarp();
+    // A last partial round of at most W/2 pairs runs as single rows on twice the warps, which
+    // halves the phase's tail (the other warps are idle then anyway).
+    const int tail = (2 * (tot % W) <= W) ? tot - tot % W : tot;
     const int first = lo + (((gw - lo) % W) + W) % W;
-    for (int it = first; it < hi; it += W) {
+    for (int it = first; it < min(hi, max(lo, tail)); it += W) {
         const int r = 2 * (it - lo);
         float a[2][T];
         zero_acc<T, 2>(a);
         mrows<T, IT, 2, TYPE>(m, r, sx, a);
         wsum_acc<T, 2>(a);
-        out(r, a);
+        out(r, a, 2);
+    }
+    const int it = tail + (gw >> 1);
+    if (gw < 2 * (tot - tail) && it >= lo && it < hi) {
+        const int r = 2 * (it - lo) + (gw & 1);
+        float b[1][T];
+        zero_acc<T, 1>(b);
+        mrows<T, IT, 1, TYPE>(m, r, sx, b);
+        wsum_acc<T, 1>(b);
+        float a[2][T];
+#pragma unroll
+        for (int t = 0; t < T; t++) a[0][t] = a[1][t] = b[0][t];
+        out(r, a, 1);
     }
 }
 
-// Q4_K or Q6_K matrix (the two types that occur for qkv / v projections)
+// Noinline dispatch so the type switch's register cost stays out of the callers.
 template <int T, int IT, class Out>
-__device__ __forceinline__ void gemv_pairs_46(const Mat & m, int lo, int hi, Out out) {
-    if (m.type == T_Q6K) gemv_pairs<T, IT, T_Q6K>(m, lo, hi, out);
-    else gemv_pairs<T, IT, T_Q4K>(m, lo, hi, out);
+__device__ __noinline__ void gemv_pairs_t(int type, const Mat m, int lo, int hi, int tot, Out out) {
+    switch (type) {
+    case T_Q4K: gemv_pairs<T, IT, T_Q4K>(m, lo, hi, tot, out); break;
+    case T_Q5K: gemv_pairs<T, IT, T_Q5K>(m, lo, hi, tot, out); break;
+    case T_Q6K: gemv_pairs<T, IT, T_Q6K>(m, lo, hi, tot, out); break;
+    default: gemv_pairs<T, IT, T_Q8_0>(m, lo, hi, tot, out); break;
+    }
 }
-
 
 // Prefetch the first `bytes` of rows row0..row0+n-1 into L2 so the DRAM stream of a phase starts
 // while its activations are still being loaded into shared memory.
@@ -632,6 +753,31 @@ __device__ __forceinline__ void pf_rows(const Mat & m, int row0, int n, int byte
         const uint8_t * p = m.w + (size_t) (row0 + k) * m.rb;
         for (int off = lane * 128; off < bytes; off += 32 * 128) asm volatile("prefetch.global.L2 [%0];" ::"l"(p + off));
     }
+}
+
+// First weight lines of a phase's first item.  main_forward also issues them before the
+// preceding grid barrier, so DRAM streams while the barrier and the activation fill complete.
+__device__ __forceinline__ void pf_resid(const Mat & W, int it) {
+    if (blockIdx.x < D / 32) pf_rows(W, 32 * blockIdx.x + 2 * (threadIdx.x >> 5), 2, W.rb / it);
+}
+__device__ __forceinline__ void pf_ffn_gu(const LayerW & W) {
+#if MK_TP > 1
+    const int row = 16 * ((threadIdx.x >> 6) * gridDim.x + blockIdx.x) + 8 * ((threadIdx.x >> 5) & 1);
+#else
+    const int row = 16 * gwarp();
+#endif
+    if (row < FF_L) {
+        pf_rows(W.fg, row, 2, 576);
+        pf_rows(W.fu, row, 2, 576);
+    }
+}
+__device__ __forceinline__ void pf_attn_proj(const LayerW & W) {
+    if (gwarp() < QG_L / 2) pf_rows(W.q, 2 * gwarp(), 2, 576);
+}
+__device__ __forceinline__ void pf_dn_proj(const LayerW & W) {
+    const int gw = gwarp(), W_ = nwarps(), lo = AB_SPLIT * 2 * NVH_L;
+    const int first = lo + (((gw - lo) % W_) + W_) % W_;
+    if (first < lo + QKV_L / 2) pf_rows(W.qkv, 2 * (first - lo), 2, 1024);
 }
 
 // lanes 0-15 quantise 16-chunk c of row t, lanes 16-31 the same chunk of row t + 1 (if valid)
@@ -688,6 +834,43 @@ __device__ __forceinline__ float dequant_q4k(const uint8_t * row, int e) {
     return d * (float) s * (float) qv - dmin * (float) m;
 }
 
+// one element of a raw GGUF row for the four embedding types; math mirrors ggml-quants.c
+__device__ __forceinline__ float dequant_elem(const uint8_t * row, int type, int e) {
+    if (type == 8) { // Q8_0: 34 B per 32
+        const uint8_t * blk = row + (e >> 5) * 34;
+        const float d = __half2float(*reinterpret_cast<const __half *>(blk));
+        return d * (float) (int8_t) blk[2 + (e & 31)];
+    }
+    if (type == 12) return dequant_q4k(row, e);
+    if (type == 13) { // Q5_K: 176 B per 256, 5th bit stored in qh
+        const int b = e >> 8, w = e & 255, g = w >> 6, l = w & 63, lo = l < 32;
+        const uint8_t * blk = row + b * 176;
+        const float d = __half2float(*reinterpret_cast<const __half *>(blk));
+        const float dmin = __half2float(*reinterpret_cast<const __half *>(blk + 2));
+        const uint8_t * sc = blk + 4;
+        const int sb = 2 * g + !lo;
+        int s, m;
+        if (sb < 4) {
+            s = sc[sb] & 63;
+            m = sc[sb + 4] & 63;
+        } else {
+            s = (sc[sb + 4] & 0xF) | ((sc[sb - 4] >> 6) << 4);
+            m = (sc[sb + 4] >> 4) | ((sc[sb] >> 6) << 4);
+        }
+        const int qb = blk[48 + 32 * g + (l & 31)];
+        const int q = (lo ? qb & 0xF : qb >> 4) + ((blk[16 + (l & 31)] >> (2 * g + !lo) & 1) ? 16 : 0);
+        return d * (float) s * (float) q - dmin * (float) m;
+    }
+    // Q6_K: 210 B per 256, ql/qh low+high bits, int8 scales
+    const int b = e >> 8, n = e & 255, l = n & 31, t = n >> 5, h = n >> 7;
+    const uint8_t * blk = row + b * 210;
+    const float d = __half2float(*reinterpret_cast<const __half *>(blk + 208));
+    const int8_t * sc = reinterpret_cast<const int8_t *>(blk + 192) + h * 8 + (l >> 4) + 2 * t;
+    const int qb = blk[h * 64 + (t & 1) * 32 + l];
+    const int q = ((t < 2 ? qb & 0xF : qb >> 4) | (((blk[128 + h * 32 + l] >> (2 * t)) & 3) << 4)) - 32;
+    return d * (float) *sc * (float) q;
+}
+
 // token embedding rows -> x, plus quantised attn_norm input for layer 0
 template <int T>
 __device__ __noinline__ void embed_prologue() {
@@ -695,25 +878,26 @@ __device__ __noinline__ void embed_prologue() {
     if (t >= T) return;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int tok = ((volatile Ctl *) cB.ctl)->tok[t];
-    const uint8_t * row = cW.embd + (size_t) tok * (D / 256 * 144);
+    const uint8_t * row = cW.embd + (size_t) tok * cW.embd_rb;
     const float * w0 = cW.L[0].attn_norm;
     for (int j = warp; j < U_D; j += NW) {
         const int e = 32 * j + lane;
-        const float v = dequant_q4k(row, e);
+        const float v = dequant_elem(row, cW.embd_type, e);
         cB.x[t * D + e] = v;
         q32_store(cB.qn, t, j, v * w0[e], v * v, true);
     }
 }
 
 // Output rows (32 consecutive rows per block item) with optional residual add; the new
-// residual value is re-quantised for the next RMS-normed consumer (weight wnext).
+// residual value is re-quantised for the next RMS-normed consumer (weight wnext).  k numbers
+// this reduction within the launch (< 4096, packed into the all-reduce flag tag).
 template <int T, int IT, int TYPE>
-__device__ __noinline__ void resid32(const Mat W, const QBuf in, float * x, bool add, const float * wnext, uint8_t * /*sm*/) {
+__device__ __noinline__ void resid32(const Mat W, const QBuf in, float * x, bool add, const float * wnext, uint8_t * /*sm*/, int k) {
     uint8_t * const sm = smem;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     float * s_rs = misc(sm);
     float * s_res = misc(sm) + 8;
-    if (blockIdx.x < D / 32) pf_rows(W, 32 * blockIdx.x + 2 * warp, 2, W.rb / IT);
+    pf_resid(W, IT);
     if (threadIdx.x < 4 && blockIdx.x + threadIdx.x * gridDim.x < D / 32) pf_l2(wnext + 32 * (blockIdx.x + threadIdx.x * gridDim.x));
     auto epilogue = [&](int j, float (&a)[2][T]) {
         wsum_acc<T, 2>(a);
@@ -725,6 +909,18 @@ __device__ __noinline__ void resid32(const Mat W, const QBuf in, float * x, bool
             }
         }
         __syncthreads();
+#if MK_TP > 1
+        // K-sharded weights leave s_res a partial; all-reduce it before it touches x, summed
+        // p0 + p1 in rank order so both cards get bit-identical values
+        {
+            float * peer = cB.xr[k & 1] + j * MAXT * 32;
+            xr_put(j, k, s_res, T * 32);
+            xr_wait(j, k);
+            for (int i = threadIdx.x; i < T * 32; i += NT)
+                s_res[i] = (cB.rank == 0) ? (s_res[i] + __ldcg(peer + i)) : (__ldcg(peer + i) + s_res[i]);
+            __syncthreads();
+        }
+#endif
         if (warp < T) {
             const int t = warp, row = 32 * j + lane;
             float xv = s_res[t * 32 + lane];
@@ -734,7 +930,8 @@ __device__ __noinline__ void resid32(const Mat W, const QBuf in, float * x, bool
         }
         __syncthreads();
     };
-    if constexpr (T * 32 * IT > SM_XU) {
+    static_assert(MK_TP == 1 || T * 32 * IT <= SM_XU, "TP=2 must not take the K-half split");
+    if constexpr (MK_TP == 1 && T * 32 * IT > SM_XU) {
         // The activations do not fit (T = 5 ffn_down): fill one K-half at a time.  A block's two row
         // groups are processed one after the other; the first group's per-lane partial sums of the
         // first half are parked in shared memory while the second group is computed.
@@ -782,6 +979,47 @@ __device__ __noinline__ void resid32(const Mat W, const QBuf in, float * x, bool
     } else {
         const SX sx = make_sx(sm, in.U);
         fill_xs<T>(in, 0, false, sx, s_rs);
+#if MK_TP > 1
+        // Send every item's partial before waiting on any, so the PCIe round trips overlap the
+        // remaining rows instead of serialising per item; partials park past the activations.
+        const int park_off = (T * in.U * 16 + 15) & ~15;
+        float * park = reinterpret_cast<float *>(sm + SM_XA + park_off);
+        const int n_items = (D / 32 - blockIdx.x + gridDim.x - 1) / gridDim.x;
+        if (n_items * T * 32 * 4 <= SM_XU * 16 - park_off) {
+            for (int i = 0; i < n_items; i++) {
+                const int j = blockIdx.x + i * gridDim.x;
+                float a[2][T];
+                zero_acc<T, 2>(a);
+                mrows<T, IT, 2, TYPE>(W, 32 * j + 2 * warp, sx, a);
+                wsum_acc<T, 2>(a);
+                float * pk = park + i * T * 32;
+                if (lane == 0) {
+#pragma unroll
+                    for (int t = 0; t < T; t++) {
+                        pk[t * 32 + 2 * warp] = a[0][t];
+                        pk[t * 32 + 2 * warp + 1] = a[1][t];
+                    }
+                }
+                __syncthreads();
+                xr_put(j, k, pk, T * 32);
+            }
+            for (int i = 0; i < n_items; i++) {
+                const int j = blockIdx.x + i * gridDim.x;
+                const float * pk = park + i * T * 32;
+                const float * peer = cB.xr[k & 1] + j * MAXT * 32;
+                xr_wait(j, k);
+                if (warp < T) {
+                    const int t = warp, row = 32 * j + lane;
+                    const float pv = __ldcg(peer + t * 32 + lane);
+                    float xv = (cB.rank == 0) ? (pk[t * 32 + lane] + pv) : (pv + pk[t * 32 + lane]);
+                    if (add) xv += __ldcg(x + t * D + row);
+                    x[t * D + row] = xv;
+                    q32_store(cB.qn, t, j, xv * wnext[row], xv * xv, true);
+                }
+            }
+            return;
+        }
+#endif
         for (int j = blockIdx.x; j < D / 32; j += gridDim.x) {
             float a[2][T];
             zero_acc<T, 2>(a);
@@ -791,39 +1029,94 @@ __device__ __noinline__ void resid32(const Mat W, const QBuf in, float * x, bool
     }
 }
 
+// Noinline dispatch so the type switch's register cost stays out of the callers.
+template <int T, int IT>
+__device__ __noinline__ void resid32_t(int type, const Mat W, const QBuf in, float * x, bool add, const float * wnext, uint8_t * sm, int k) {
+    switch (type) {
+    case T_Q4K: resid32<T, IT, T_Q4K>(W, in, x, add, wnext, sm, k); break;
+    case T_Q5K: resid32<T, IT, T_Q5K>(W, in, x, add, wnext, sm, k); break;
+    case T_Q6K: resid32<T, IT, T_Q6K>(W, in, x, add, wnext, sm, k); break;
+    default: resid32<T, IT, T_Q8_0>(W, in, x, add, wnext, sm, k); break;
+    }
+}
+
 // FFN gate/up: warp item = 16 consecutive rows of both matrices (4 rows in flight sharing the
 // activations) -> silu(g)*u quantised per 16-chunk for the down projection.
-template <int T>
-__device__ __noinline__ void ffn_gu(const LayerW & W, uint8_t * /*sm*/) {
+template <int T, int TYPE>
+__device__ __noinline__ void ffn_gu_q(const LayerW & W, uint8_t * /*sm*/) {
     uint8_t * const sm = smem;
     const int lane = threadIdx.x & 31;
     const SX sx = make_sx(sm, U_D);
     const float * s_rs = misc(sm);
-    if (gwarp() < FF / 16) {
-        pf_rows(W.fg, 16 * gwarp(), 2, 576);
-        pf_rows(W.fu, 16 * gwarp(), 2, 576);
-    }
+    pf_ffn_gu(W);
     fill_xs<T>(cB.qn, 0, true, sx, misc(sm));
     const uint8_t * gw = W.fg.w;
     const uint8_t * uw = W.fu.w;
+    const __half * gd = W.fg.d;
+    const __half * ud = W.fu.d;
     const int rb = W.fg.rb;
-    for (int j = gwarp(); j < FF / 16; j += nwarps()) {
+    const int nd = W.fg.nd;
+#if MK_TP > 1
+    // A card holds too few 16-row items to busy every warp, so a warp pair splits each item
+    // (8 rows each) and the lower warp quantises the 16-chunk from both halves.
+    static_assert(MAXT * U_D * 16 + NW * MAXT * 16 * 4 <= SM_XU * 16, "ffn_gu pair exchange buffer");
+    float * s_act = reinterpret_cast<float *>(sm + SM_XA + MAXT * U_D * 16) + (threadIdx.x >> 6) * 2 * MAXT * 16;
+    const int half = (threadIdx.x >> 5) & 1, bar_id = 1 + (threadIdx.x >> 6);
+    int buf = 0;
+    for (int j = (threadIdx.x >> 6) * gridDim.x + blockIdx.x; j < FF_L / 16; j += nwarps() / 2, buf ^= 1) {
         float act[T];
 #pragma unroll
         for (int t = 0; t < T; t++) act[t] = 0.f;
-        constexpr int RG = T >= 3 ? 1 : 2; // rows per matrix per step (fewer at large T: register budget)
+#pragma unroll 1
+        for (int r = 0; r < 8; r++) {
+            const int row = 16 * j + 8 * half + r;
+            const uint8_t * rp[2] = {gw + (size_t) row * rb, uw + (size_t) row * rb};
+            const __half * dp[2] = {gd + (size_t) row * nd, ud + (size_t) row * nd};
+            float a[2][T];
+            zero_acc<T, 2>(a);
+            rows_any<T, 5, 2, TYPE>(rp, dp, sx, a);
+            wsum_acc<T, 2>(a);
+            if (lane == r) {
+#pragma unroll
+                for (int t = 0; t < T; t++) act[t] = silu(a[0][t] * s_rs[t]) * (a[1][t] * s_rs[t]);
+            }
+        }
+        float * sa = s_act + buf * MAXT * 16;
+        if (lane < 8) {
+#pragma unroll
+            for (int t = 0; t < T; t++) sa[t * 16 + 8 * half + lane] = act[t];
+        }
+        // double-buffered sa: the next write to this buffer comes after the next pair barrier
+        asm volatile("bar.sync %0, 64;" ::"r"(bar_id) : "memory");
+        if (half == 0) {
+#pragma unroll
+            for (int t = 0; t < T; t += 2) {
+                const int tt = lane < 16 ? t : (t + 1 < T ? t + 1 : t);
+                q16_store(cB.qa, tt, j, sa[tt * 16 + (lane & 15)], lane < 16 || t + 1 < T);
+            }
+        }
+    }
+#else
+    for (int j = gwarp(); j < FF_L / 16; j += nwarps()) {
+        float act[T];
+#pragma unroll
+        for (int t = 0; t < T; t++) act[t] = 0.f;
+        constexpr int RG = (T >= 3 || TYPE != T_Q4K) ? 1 : 2; // rows per matrix per step (fewer at large T or non-Q4K: register budget)
 #pragma unroll 1
         for (int r = 0; r < 16; r += RG) {
             const int row = 16 * j + r;
             const uint8_t * rp[2 * RG];
+            const __half * dp[2 * RG];
 #pragma unroll
             for (int k = 0; k < RG; k++) {
                 rp[k] = gw + (size_t) (row + k) * rb;
                 rp[RG + k] = uw + (size_t) (row + k) * rb;
+                dp[k] = gd + (size_t) (row + k) * nd;
+                dp[RG + k] = ud + (size_t) (row + k) * nd;
             }
             float a[2 * RG][T];
             zero_acc<T, 2 * RG>(a);
-            rows_q4k<T, 5, 2 * RG>(rp, sx, a);
+            rows_any<T, 5, 2 * RG, TYPE>(rp, dp, sx, a);
             wsum_acc<T, 2 * RG>(a);
 #pragma unroll
             for (int k = 0; k < RG; k++)
@@ -839,6 +1132,19 @@ __device__ __noinline__ void ffn_gu(const LayerW & W, uint8_t * /*sm*/) {
             q16_store(cB.qa, lane < 16 ? t : t + 1, j, v, lane < 16 || t + 1 < T);
         }
     }
+#endif
+}
+
+// Noinline dispatch that reads the gate type itself so the load stays out of the inlined callers' register budget.
+template <int T>
+__device__ __noinline__ void ffn_gu(const LayerW & W, uint8_t * sm) {
+    const int type = W.fg.type;
+    switch (type) {
+    case T_Q4K: ffn_gu_q<T, T_Q4K>(W, sm); break;
+    case T_Q5K: ffn_gu_q<T, T_Q5K>(W, sm); break;
+    case T_Q6K: ffn_gu_q<T, T_Q6K>(W, sm); break;
+    default: ffn_gu_q<T, T_Q8_0>(W, sm); break;
+    }
 }
 
 template <int T>
@@ -851,12 +1157,12 @@ __device__ __forceinline__ void store_lane_t(float * base, int stride, int idx, 
 
 // a[k][t] -> base[t * stride + idx + k]
 template <int T>
-__device__ __forceinline__ void store_pair_t(float * base, int stride, int idx, const float (&a)[2][T]) {
+__device__ __forceinline__ void store_pair_t(float * base, int stride, int idx, const float (&a)[2][T], int nr) {
     const int lane = threadIdx.x & 31;
     const float * s_rs = misc(nullptr);
 #pragma unroll
     for (int t = 0; t < T; t++)
-        if ((lane >> 1) == t) base[t * stride + idx + (lane & 1)] = ((lane & 1) ? a[1][t] : a[0][t]) * s_rs[t];
+        if ((lane >> 1) == t && (lane & 1) < nr) base[t * stride + idx + (lane & 1)] = ((lane & 1) ? a[1][t] : a[0][t]) * s_rs[t];
 }
 
 // delta-net input projections: alpha/beta (fp32), qkv -> conv ring, z
@@ -866,18 +1172,14 @@ __device__ __noinline__ void dn_proj(const LayerW & W, int dl, int n, int dn_c, 
     const int lane = threadIdx.x & 31;
     const SX sx = make_sx(sm, U_D);
     float * s_rs = misc(sm);
-    {
-        const int gw = gwarp(), W_ = nwarps(), lo = AB_SPLIT * 2 * NVH;
-        const int first = lo + (((gw - lo) % W_) + W_) % W_;
-        if (first < lo + QKV / 2) pf_rows(W.qkv, 2 * (first - lo), 2, 1024);
-    }
+    pf_dn_proj(W);
     fill_xs<T>(cB.qn, 0, true, sx, s_rs);
-    float * conv = cB.conv + (size_t) dl * CONV_RING * QKV;
-    const int n_ab = AB_SPLIT * 2 * NVH, n_qkv = QKV / 2, n_z = VD / 2;
+    float * conv = cB.conv + (size_t) dl * CONV_RING * QKV_L;
+    const int n_ab = AB_SPLIT * 2 * NVH_L, n_qkv = QKV_L / 2, n_z = VD_L / 2;
     // alpha / beta: fp32 rows with the norm weight folded in (dot with the raw residual), each
     // row split into AB_SPLIT K-chunks so these heavier items do not form a tail
     for (int it = gwarp(); it < n_ab; it += nwarps()) {
-        const int row = it % (2 * NVH), ch = it / (2 * NVH);
+        const int row = it % (2 * NVH_L), ch = it / (2 * NVH_L);
         const float * wr = W.ab + (size_t) row * D;
         float acc[T];
 #pragma unroll
@@ -892,22 +1194,23 @@ __device__ __noinline__ void dn_proj(const LayerW & W, int dl, int n, int dn_c, 
         }
 #pragma unroll
         for (int t = 0; t < T; t++) acc[t] = wsum(acc[t]) * s_rs[t];
-        store_lane_t<T>(cB.ab + ch * MAXT * 2 * NVH, 2 * NVH, row, acc);
+        store_lane_t<T>(cB.ab + ch * MAXT * 2 * NVH_L, 2 * NVH_L, row, acc);
     }
-    gemv_pairs_46<T, 5>(W.qkv, n_ab, n_ab + n_qkv, [=](int r, const float (&a)[2][T]) {
+    const int n_all = n_ab + n_qkv + n_z;
+    gemv_pairs_t<T, 5>(W.qkv.type, W.qkv, n_ab, n_ab + n_qkv, n_all, [=](int r, const float (&a)[2][T], int nr) {
         const int lane = threadIdx.x & 31;
 #pragma unroll
         for (int t = 0; t < T; t++)
-            if ((lane >> 1) == t)
-                conv[((n + t) % CONV_RING) * QKV + r + (lane & 1)] = ((lane & 1) ? a[1][t] : a[0][t]) * misc(nullptr)[t];
+            if ((lane >> 1) == t && (lane & 1) < nr)
+                conv[((n + t) % CONV_RING) * QKV_L + r + (lane & 1)] = ((lane & 1) ? a[1][t] : a[0][t]) * misc(nullptr)[t];
     });
-    gemv_pairs<T, 5, T_Q4K>(W.gate, n_ab + n_qkv, n_ab + n_qkv + n_z,
-                            [=](int r, const float (&a)[2][T]) { store_pair_t<T>(cB.z, VD, r, a); });
+    gemv_pairs_t<T, 5>(W.gate.type, W.gate, n_ab + n_qkv, n_all, n_all,
+                       [=](int r, const float (&a)[2][T], int nr) { store_pair_t<T>(cB.z, VD_L, r, a, nr); });
     // Warm L2 with what dn_core will read, while the other blocks are still projecting:
     // the head's recurrent state (64 KB), its conv weights, older conv rows and replay entries.
-    if (blockIdx.x < NVH) {
-        const int h = blockIdx.x, kh = h % NKH, tid = threadIdx.x;
-        pf_l2(cB.dstate + ((size_t) dl * NVH + h) * 128 * 128 + tid * 32);
+    if (blockIdx.x < NVH_L) {
+        const int h = blockIdx.x, kh = h % NKH_L, tid = threadIdx.x;
+        pf_l2(cB.dstate + ((size_t) dl * NVH_L + h) * 128 * 128 + tid * 32);
         if (tid == 0) {
             pf_l2(W.dt + (h & ~31));
             pf_l2(W.A + (h & ~31));
@@ -917,17 +1220,17 @@ __device__ __noinline__ void dn_proj(const LayerW & W, int dl, int n, int dn_c, 
             pf_l2(W.snorm + 96);
         }
         if (tid < 384) {
-            const int ch = tid < 128 ? kh * 128 + tid : (tid < 256 ? 2048 + kh * 128 + (tid - 128) : 4096 + h * 128 + (tid - 256));
+            const int ch = tid < 128 ? kh * 128 + tid : (tid < 256 ? NKH_L * HK + kh * 128 + (tid - 128) : 2 * NKH_L * HK + h * 128 + (tid - 256));
             if ((tid & 7) == 0) pf_l2(W.conv + ch * 4);
             if ((tid & 31) == 0)
                 for (int j = 0; j < 3; j++)
-                    if (n - 3 + j >= 0) pf_l2(conv + ((n - 3 + j) % CONV_RING) * QKV + ch);
+                    if (n - 3 + j >= 0) pf_l2(conv + ((n - 3 + j) % CONV_RING) * QKV_L + ch);
         }
-        const float * ring = cB.kvgb + (size_t) dl * KV_RING * KVGB;
+        const float * ring = cB.kvgb + (size_t) dl * KV_RING * KVGB_L;
         for (int i = tid; i < (n - dn_c) * 8; i += NT) {
-            const float * slot = ring + (size_t) ((dn_c + (i >> 3)) % KV_RING) * KVGB;
+            const float * slot = ring + (size_t) ((dn_c + (i >> 3)) % KV_RING) * KVGB_L;
             const int c = (i & 7);
-            pf_l2(c < 4 ? slot + kh * 128 + c * 32 : slot + KVGB_V + h * 128 + (c - 4) * 32);
+            pf_l2(c < 4 ? slot + kh * 128 + c * 32 : slot + KVGB_V_L + h * 128 + (c - 4) * 32);
         }
     }
 }
@@ -938,8 +1241,8 @@ template <int T>
 __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, int n_commit, uint8_t * /*sm*/) {
     uint8_t * const sm = smem;
     const int h = blockIdx.x;
-    if (h >= NVH) return;
-    const int kh = h % NKH;
+    if (h >= NVH_L) return;
+    const int kh = h % NKH_L;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     // thread owns state column `col`, rows [32 r, 32 r + 32)  (S stored as [col][row])
     const int col = tid >> 2, r = tid & 3;
@@ -953,24 +1256,24 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
     float * s_gb = s_z + T * 128;                // [NE][2]
     float * s_raw = s_gb + 32;                   // [T][384] conv outputs (silu), 16-byte aligned
 
-    float * Sg = cB.dstate + ((size_t) dl * NVH + h) * 128 * 128 + col * 128 + 32 * r;
+    float * Sg = cB.dstate + ((size_t) dl * NVH_L + h) * 128 * 128 + col * 128 + 32 * r;
     float4 S[8];
 #pragma unroll
     for (int i = 0; i < 8; i++) S[i] = __ldcg(reinterpret_cast<const float4 *>(Sg) + i);
 
     const int np = n - dn_c; // replayed (accepted, not yet committed) tokens
-    float * ring = cB.kvgb + (size_t) dl * KV_RING * KVGB;
-    const float * conv = cB.conv + (size_t) dl * CONV_RING * QKV;
+    float * ring = cB.kvgb + (size_t) dl * KV_RING * KVGB_L;
+    const float * conv = cB.conv + (size_t) dl * CONV_RING * QKV_L;
 
     // ---- prologue: every input of every event, one round of loads ----
     if (tid < 384) {
-        const int ch = tid < 128 ? kh * 128 + tid : (tid < 256 ? 2048 + kh * 128 + (tid - 128) : 4096 + h * 128 + (tid - 256));
+        const int ch = tid < 128 ? kh * 128 + tid : (tid < 256 ? NKH_L * HK + kh * 128 + (tid - 128) : 2 * NKH_L * HK + h * 128 + (tid - 256));
         const float4 w = *reinterpret_cast<const float4 *>(W.conv + ch * 4);
         float raw[T + 3];
 #pragma unroll
         for (int j = 0; j < T + 3; j++) {
             const int p = n - 3 + j;
-            raw[j] = p >= 0 ? __ldcg(conv + (p % CONV_RING) * QKV + ch) : 0.f;
+            raw[j] = p >= 0 ? __ldcg(conv + (p % CONV_RING) * QKV_L + ch) : 0.f;
         }
 #pragma unroll
         for (int t = 0; t < T; t++)
@@ -980,8 +1283,8 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
         float al = 0.f, be = 0.f;
 #pragma unroll
         for (int c = 0; c < AB_SPLIT; c++) {
-            al += __ldcg(cB.ab + (c * MAXT + t) * 2 * NVH + h);
-            be += __ldcg(cB.ab + (c * MAXT + t) * 2 * NVH + NVH + h);
+            al += __ldcg(cB.ab + (c * MAXT + t) * 2 * NVH_L + h);
+            be += __ldcg(cB.ab + (c * MAXT + t) * 2 * NVH_L + NVH_L + h);
         }
         float sp = al + W.dt[h];
         sp = sp > 20.0f ? sp : logf(1.0f + expf(sp));
@@ -989,17 +1292,17 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
         s_gb[2 * (np + t) + 1] = 1.0f / (1.0f + expf(-be));
     } else if (tid >= 448 && tid < 448 + np) {
         const int e = tid - 448;
-        const float * slot = ring + (size_t) ((dn_c + e) % KV_RING) * KVGB;
-        s_gb[2 * e] = __ldcg(slot + KVGB_G + h);
-        s_gb[2 * e + 1] = __ldcg(slot + KVGB_B + h);
+        const float * slot = ring + (size_t) ((dn_c + e) % KV_RING) * KVGB_L;
+        s_gb[2 * e] = __ldcg(slot + KVGB_G_L + h);
+        s_gb[2 * e + 1] = __ldcg(slot + KVGB_B_L + h);
     }
     for (int i = tid; i < np * 128; i += NT) { // replayed k / v
         const int e = i >> 7, c = i & 127;
-        const float * slot = ring + (size_t) ((dn_c + e) % KV_RING) * KVGB;
+        const float * slot = ring + (size_t) ((dn_c + e) % KV_RING) * KVGB_L;
         s_k[e * QS + (c >> 5) * 36 + (c & 31)] = __ldcg(slot + kh * 128 + c);
-        s_v[e * 128 + c] = __ldcg(slot + KVGB_V + h * 128 + c);
+        s_v[e * 128 + c] = __ldcg(slot + KVGB_V_L + h * 128 + c);
     }
-    for (int i = tid; i < T * 128; i += NT) s_z[i] = __ldcg(cB.z + (i >> 7) * VD + h * 128 + (i & 127));
+    for (int i = tid; i < T * 128; i += NT) s_z[i] = __ldcg(cB.z + (i >> 7) * VD_L + h * 128 + (i & 127));
     __syncthreads();
 
     // l2-normalise q and k of the new tokens (warp 2t: q of token t, warp 2t+1: k), copy v
@@ -1018,12 +1321,12 @@ __device__ __noinline__ void dn_core(const LayerW & W, int dl, int n, int dn_c, 
     // save the new tokens' (k, v, g, beta) for a possible replay next cycle
     for (int i = tid; i < T * 128; i += NT) {
         const int t = i >> 7, c = i & 127;
-        float * slot = ring + (size_t) ((n + t) % KV_RING) * KVGB;
-        if (h < NKH) slot[h * 128 + c] = s_k[(np + t) * QS + (c >> 5) * 36 + (c & 31)];
-        slot[KVGB_V + h * 128 + c] = s_v[(np + t) * 128 + c];
+        float * slot = ring + (size_t) ((n + t) % KV_RING) * KVGB_L;
+        if (h < NKH_L) slot[h * 128 + c] = s_k[(np + t) * QS + (c >> 5) * 36 + (c & 31)];
+        slot[KVGB_V_L + h * 128 + c] = s_v[(np + t) * 128 + c];
         if (c == 0) {
-            slot[KVGB_G + h] = s_gb[2 * (np + t)];
-            slot[KVGB_B + h] = s_gb[2 * (np + t) + 1];
+            slot[KVGB_G_L + h] = s_gb[2 * (np + t)];
+            slot[KVGB_B_L + h] = s_gb[2 * (np + t) + 1];
         }
     }
 
@@ -1144,7 +1447,7 @@ __device__ __forceinline__ void kv_stage(uint8_t * dst, size_t row0, int rows, i
     }
 }
 
-// split-K over the context: at most 20 chunks per kv head so all 4 x nch items run in one wave
+// split-K over the context: at most 20 chunks per kv head so all NKV_L x nch items run in one wave
 __device__ __forceinline__ void attn_dims(int L_ctx, int & nch, int & cs) {
     nch = max(1, min(20, (L_ctx + 63) / 64));
     cs = (L_ctx + nch - 1) / nch;
@@ -1157,12 +1460,13 @@ __device__ __noinline__ void attn_proj(const LayerW & W, int slot, int n, uint8_
     const int lane = threadIdx.x & 31;
     (void) lane;
     const SX sx = make_sx(sm, U_D);
-    if (gwarp() < QG / 2) pf_rows(W.q, 2 * gwarp(), 2, 576);
+    pf_attn_proj(W);
     fill_xs<T>(cB.qn, 0, true, sx, misc(sm));
-    const int nq = QG / 2, nk = KVD / 2;
-    gemv_pairs<T, 5, T_Q4K>(W.q, 0, nq, [=](int r, const float (&a)[2][T]) { store_pair_t<T>(cB.qbuf, QG, r, a); });
-    gemv_pairs<T, 5, T_Q4K>(W.k, nq, nq + nk, [=](int r, const float (&a)[2][T]) { store_pair_t<T>(cB.kbuf, KVD, r, a); });
-    gemv_pairs_46<T, 5>(W.v, nq + nk, nq + 2 * nk, [=](int r, const float (&a)[2][T]) { store_pair_t<T>(cB.vbuf, KVD, r, a); });
+    const int nq = QG_L / 2, nk = KVD_L / 2;
+    const int n_all = nq + 2 * nk;
+    gemv_pairs_t<T, 5>(W.q.type, W.q, 0, nq, n_all, [=](int r, const float (&a)[2][T], int nr) { store_pair_t<T>(cB.qbuf, QG_L, r, a, nr); });
+    gemv_pairs_t<T, 5>(W.k.type, W.k, nq, nq + nk, n_all, [=](int r, const float (&a)[2][T], int nr) { store_pair_t<T>(cB.kbuf, KVD_L, r, a, nr); });
+    gemv_pairs_t<T, 5>(W.v.type, W.v, nq + nk, n_all, n_all, [=](int r, const float (&a)[2][T], int nr) { store_pair_t<T>(cB.vbuf, KVD_L, r, a, nr); });
     // Warm L2 with what attn_core reads first: q/k norm weights, RoPE rows of the new positions,
     // and the first K / V tile of this block's attention item (positions < n).
     pf_block(W.qn, HD * 4);
@@ -1172,9 +1476,9 @@ __device__ __noinline__ void attn_proj(const LayerW & W, int slot, int n, uint8_
     attn_dims(n + T, nch, CS);
     const size_t ctx = cB.ctx;
     const int rowb = cB.kvq8 ? HD : HD * 2, lines = rowb / 128; // bytes, 128-byte lines per K / V row
-    const uint8_t * Kc = static_cast<const uint8_t *>(cB.kc) + (size_t) slot * NKV * ctx * rowb;
-    const uint8_t * Vc = static_cast<const uint8_t *>(cB.vc) + (size_t) slot * NKV * ctx * rowb;
-    for (int item = blockIdx.x; item < NKV * nch; item += gridDim.x) {
+    const uint8_t * Kc = static_cast<const uint8_t *>(cB.kc) + (size_t) slot * NKV_L * ctx * rowb;
+    const uint8_t * Vc = static_cast<const uint8_t *>(cB.vc) + (size_t) slot * NKV_L * ctx * rowb;
+    for (int item = blockIdx.x; item < NKV_L * nch; item += gridDim.x) {
         const int g = item / nch, c0 = (item % nch) * CS, c1 = min(n, min(c0 + CS, c0 + 64));
         for (int i = threadIdx.x; i < (c1 - c0) * lines; i += NT) {
             const size_t off = ((size_t) g * ctx + c0 + i / lines) * rowb + (i % lines) * 128;
@@ -1240,7 +1544,7 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
     float * sL = sM + 32;
     float * sAl = sL + 32;
     const size_t ctx = cB.ctx;
-    const size_t slot0 = (size_t) slot * NKV * ctx; // first row of this slot
+    const size_t slot0 = (size_t) slot * NKV_L * ctx; // first row of this slot
     __half * Kc = static_cast<__half *>(cB.kc) + slot0 * HD;
     __half * Vc = static_cast<__half *>(cB.vc) + slot0 * HD;
     const int mt = warp >> 3, wn = warp & 7; // MMA work split: warp -> (row tile, column group)
@@ -1266,7 +1570,7 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
         }
         asm volatile("cp.async.commit_group;" ::: "memory");
     };
-    for (int item = blockIdx.x; item < NKV * nch; item += gridDim.x) {
+    for (int item = blockIdx.x; item < NKV_L * nch; item += gridDim.x) {
         const int g = item / nch, c = item % nch;
         const int c0 = c * CS, c1 = min(L_ctx, c0 + CS);
         // one round of small loads (q rows, norm weights, RoPE rows) before any bulk K/V traffic:
@@ -1279,7 +1583,7 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
             const int r = warp + 16 * k2;
             if (r < R) {
                 const int hq = r / T, t = r % T, head = g * 6 + hq;
-                load8(cB.qbuf + t * QG + head * 512 + lane * 8, qv[k2]);
+                load8(cB.qbuf + t * QG_L + head * 512 + lane * 8, qv[k2]);
                 if (lane < 8) {
                     const float2 * tab = cB.rope + (size_t) (n + t) * 32 + (lane & 3) * 8;
 #pragma unroll
@@ -1320,7 +1624,7 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
         for (int pp = pn0 + warp; pp < pn1; pp += NW) {
             const int t = pp - n;
             float v[8];
-            load8(cB.kbuf + t * KVD + g * 256 + lane * 8, v);
+            load8(cB.kbuf + t * KVD_L + g * 256 + lane * 8, v);
             float ss = 0.f;
 #pragma unroll
             for (int k = 0; k < 8; k++) ss += v[k] * v[k];
@@ -1331,7 +1635,7 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
             const size_t row = slot0 + (size_t) g * ctx + pp;
             if constexpr (Q8) kv_store_q8(static_cast<int8_t *>(cB.kc) + row * HD, cB.ksc + row * (HD / 32), v);
             else kv_store_f16(static_cast<__half *>(cB.kc) + row * HD, v);
-            load8(cB.vbuf + t * KVD + g * 256 + lane * 8, v);
+            load8(cB.vbuf + t * KVD_L + g * 256 + lane * 8, v);
             if constexpr (Q8) kv_store_q8(static_cast<int8_t *>(cB.vc) + row * HD, cB.vsc + row * (HD / 32), v);
             else kv_store_f16(static_cast<__half *>(cB.vc) + row * HD, v);
         }
@@ -1476,7 +1780,7 @@ __device__ __noinline__ void attn_combine(int n) {
     int nch, CS;
     attn_dims(L_ctx, nch, CS);
     const int tid = threadIdx.x, d = tid & 255, wh = (tid & 255) >> 5;
-    for (int it = blockIdx.x * 2 + (tid >> 8); it < NH * T; it += 2 * gridDim.x) {
+    for (int it = blockIdx.x * 2 + (tid >> 8); it < NH_L * T; it += 2 * gridDim.x) {
         const int h = it / T, t = it % T, g = h / 6, r = (h % 6) * T + t;
         float M = -INFINITY;
         for (int c = 0; c < nch; c++) M = fmaxf(M, __ldcg(&cB.aml[(g * nch + c) * AR + r].x));
@@ -1487,7 +1791,7 @@ __device__ __noinline__ void attn_combine(int n) {
             num += w * __ldcg(cB.apart + ((size_t) (g * nch + c) * AR + r) * 256 + d);
             den += w * ml.y;
         }
-        const float gate = __ldcg(cB.qbuf + t * QG + h * 512 + 256 + d);
+        const float gate = __ldcg(cB.qbuf + t * QG_L + h * 512 + 256 + d);
         const float o = num / den / (1.0f + expf(-gate));
         q32_store(cB.qo, t, 8 * h + wh, o, 0.f, false);
     }
@@ -1536,11 +1840,16 @@ __device__ __forceinline__ bool topk_insert(float & tv, int & ti, float v, int i
 // TOPK_MAX best logits of each row in cB.cand (for sampling).  FULL: additionally stores every
 // logit of each row in cB.logits (scoring).
 template <int TL, bool TOPK = false, bool FULL = false>
-__device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int * s_tok) {
+__device__ __noinline__ bool lm_head(int t0, bool draft, int kx, uint8_t * /*sm*/, int * s_tok) {
     uint8_t * const sm = smem;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const SX sx = make_sx(sm, U_D);
     float * m = misc(sm);
+#if MK_TP > 1
+    const int off = cB.rank * VOCAB_L; // this card holds output rows [rank*VOCAB_L, +VOCAB_L)
+#else
+    const int off = 0;
+#endif
     pf_rows(draft ? cW.head_d : cW.head, 2 * gwarp(), 2, 896);
     fill_xs<TL>(cB.qn, t0, true, sx, m);
     float bv[TL];
@@ -1554,25 +1863,28 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
     for (int r = 2 * gwarp(); r < head.N; r += 2 * nwarps()) {
         float a[2][TL];
         zero_acc<TL, 2>(a);
-        mrows<TL, 5, 2, T_Q6K>(head, r, sx, a);
+        mrows_t<TL, 5, 2>(head.type, head, r, sx, a);
         wsum_acc<TL, 2>(a);
         if constexpr (FULL) {
             if (lane == 0) {
 #pragma unroll
                 for (int t = 0; t < TL; t++) {
-                    cB.logits[(size_t) (t0 + t) * VOCAB + r] = a[0][t] * m[t];
-                    cB.logits[(size_t) (t0 + t) * VOCAB + r + 1] = a[1][t] * m[t];
+                    cB.logits[(size_t) (t0 + t) * VOCAB_L + r] = a[0][t] * m[t];
+                    cB.logits[(size_t) (t0 + t) * VOCAB_L + r + 1] = a[1][t] * m[t];
                 }
             }
         }
 #pragma unroll
         for (int t = 0; t < TL; t++) {
             if constexpr (TOPK) { // true logits: apply the final RMS norm scale (irrelevant to the argmax)
-                topk_insert(bv[t], bi[t], a[0][t] * m[t], r);
-                topk_insert(bv[t], bi[t], a[1][t] * m[t], r + 1);
-            } else {
+                topk_insert(bv[t], bi[t], a[0][t] * m[t], r + off);
+                topk_insert(bv[t], bi[t], a[1][t] * m[t], r + 1 + off);
+            } else if (draft) { // draft greedy keeps local ids; the winner is converted after the block merge
                 if (a[0][t] > bv[t]) { bv[t] = a[0][t]; bi[t] = r; }
                 if (a[1][t] > bv[t]) { bv[t] = a[1][t]; bi[t] = r + 1; }
+            } else {
+                if (a[0][t] > bv[t]) { bv[t] = a[0][t]; bi[t] = r + off; }
+                if (a[1][t] > bv[t]) { bv[t] = a[1][t]; bi[t] = r + 1 + off; }
             }
         }
     }
@@ -1623,6 +1935,40 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
     if (!s_last[0]) return false;
     __threadfence();
     if constexpr (TOPK) {
+#if MK_TP > 1
+        // single lx slot: consecutive lm_head exchanges are separated by a resid32 all-reduce
+        float2 * own = reinterpret_cast<float2 *>(sm); // [TL][TOPK_MAX], reuses the dead wl
+        if (warp < TL) {
+            float v = -INFINITY;
+            int id = -1;
+            for (int k = 0; k < (int) gridDim.x; k++)
+                for (int j = 0; j < 32; j++) {
+                    const float2 e = __ldcg(&cB.blk_best[((size_t) k * MAXT + warp) * TOPK_MAX + j]);
+                    if (!topk_insert(v, id, e.x, __float_as_int(e.y))) break;
+                }
+            own[warp * TOPK_MAX + lane] = make_float2(v, __int_as_float(id));
+        }
+        __syncthreads();
+        lx_put(kx, own, TL * TOPK_MAX);
+        lx_wait(kx);
+        if (warp < TL) {
+            const float2 * pl = cB.lx + warp * TOPK_MAX; // peer data: read past L1
+            const float2 * ol = own + warp * TOPK_MAX;
+            float v = -INFINITY;
+            int id = -1;
+            for (int j = 0; j < TOPK_MAX; j++) {
+                const float2 e = (cB.rank == 0) ? ol[j] : __ldcg(pl + j);
+                if (!topk_insert(v, id, e.x, __float_as_int(e.y))) break;
+            }
+            for (int j = 0; j < TOPK_MAX; j++) {
+                const float2 e = (cB.rank == 0) ? __ldcg(pl + j) : ol[j];
+                if (!topk_insert(v, id, e.x, __float_as_int(e.y))) break;
+            }
+            cB.cand[warp * TOPK_MAX + lane] = make_float2(v, __int_as_float(id));
+            const int best = __shfl_sync(0xffffffffu, id, 0);
+            if (lane == 0) s_tok[warp] = best;
+        }
+#else
         if (warp < TL) {
             float v = -INFINITY;
             int id = -1;
@@ -1635,15 +1981,41 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
             const int best = __shfl_sync(0xffffffffu, id, 0);
             if (lane == 0) s_tok[warp] = best;
         }
-    } else if (tid < TL) {
+#endif
+    } else {
         float b = -INFINITY;
         int ix = 0;
-        for (int k = 0; k < (int) gridDim.x; k++) {
-            const float2 e = __ldcg(&cB.blk_best[k * MAXT + tid]);
-            const int id = __float_as_int(e.y);
-            if (e.x > b || (e.x == b && id < ix)) { b = e.x; ix = id; }
+#if MK_TP > 1
+        // single lx slot: consecutive lm_head exchanges are separated by a resid32 all-reduce
+        float2 * own = reinterpret_cast<float2 *>(sm); // [TL], reuses the dead region at offset 0
+#endif
+        if (tid < TL) {
+            for (int k = 0; k < (int) gridDim.x; k++) {
+                const float2 e = __ldcg(&cB.blk_best[k * MAXT + tid]);
+                const int id = __float_as_int(e.y);
+                if (e.x > b || (e.x == b && id < ix)) { b = e.x; ix = id; }
+            }
+            if (draft) ix = cW.draft_ids ? cW.draft_ids[ix] : ix + off;
+#if MK_TP > 1
+            own[tid] = make_float2(b, __int_as_float(ix));
+#endif
         }
-        s_tok[tid] = (draft && cW.draft_ids) ? cW.draft_ids[ix] : ix;
+#if MK_TP > 1
+        __syncthreads();
+        lx_put(kx, own, TL);
+        lx_wait(kx);
+        if (tid < TL) {
+            const float2 pe = __ldcg(cB.lx + tid);
+            const float2 p0 = (cB.rank == 0) ? own[tid] : pe;
+            const float2 p1 = (cB.rank == 0) ? pe : own[tid];
+            ix = __float_as_int(p0.y);
+            const int p1i = __float_as_int(p1.y);
+            if (p1.x > p0.x || (p1.x == p0.x && p1i < ix)) ix = p1i;
+            s_tok[tid] = ix;
+        }
+#else
+        if (tid < TL) s_tok[tid] = ix;
+#endif
     }
     if (tid == 0) *cB.cnt = 0;
     __syncthreads();
@@ -1795,22 +2167,30 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
             attn_core<T>(W, L / 4, n, sm);
             gsync(epoch, PH_ATTN_CORE);
             attn_combine<T>(n);
+            pf_resid(W.o, U_VD_L / 32);
             gsync(epoch, PH_ATTN_COMB);
-            resid32<T, 6, T_Q4K>(W.o, cB.qo, cB.x, true, W.post_norm, sm);
+            resid32_t<T, U_VD_L / 32>(W.o.type, W.o, cB.qo, cB.x, true, W.post_norm, sm, 2 * L);
+            pf_ffn_gu(W);
             gsync(epoch, PH_RESID_O);
         } else {
             dn_proj<T>(W, dl, n, dn_c, sm);
             gsync(epoch, PH_DN_PROJ);
             dn_core<T>(W, dl, n, dn_c, n_commit, sm);
+            pf_resid(W.sout, U_VD_L / 32);
             gsync(epoch, PH_DN_CORE);
-            resid32<T, 6, T_Q5K>(W.sout, cB.qo, cB.x, true, W.post_norm, sm);
+            resid32_t<T, U_VD_L / 32>(W.sout.type, W.sout, cB.qo, cB.x, true, W.post_norm, sm, 2 * L);
+            pf_ffn_gu(W);
             gsync(epoch, PH_RESID_SOUT);
             dl++;
         }
         ffn_gu<T>(W, sm);
+        pf_resid(W.fd, U_FF_L / 32);
         gsync(epoch, PH_FFN_GU);
-        if (W.fd.type == T_Q6K) resid32<T, 17, T_Q6K>(W.fd, cB.qa, cB.x, true, wnext, sm);
-        else resid32<T, 17, T_Q4K>(W.fd, cB.qa, cB.x, true, wnext, sm);
+        resid32_t<T, U_FF_L / 32>(W.fd.type, W.fd, cB.qa, cB.x, true, wnext, sm, 2 * L + 1);
+        if (L + 1 < NL) {
+            if (cW.L[L + 1].attn) pf_attn_proj(cW.L[L + 1]);
+            else pf_dn_proj(cW.L[L + 1]);
+        }
         gsync(epoch, PH_FFN_DOWN);
     }
     write_h_rows<T>(cB.x, cB.qn, cW.onorm, cB.h_hist, n, true, sm);
@@ -1820,12 +2200,12 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
     int tl = 0;
     const bool sampling = P.temp > 0.0f && !P.score;
     if (P.mode == MODE_DECODE || P.score) {
-        if (sampling) am_last = lm_head<T, true>(0, false, sm, s_tok);
-        else if (P.score == 2) am_last = lm_head<T, false, true>(0, false, sm, s_tok);
-        else am_last = lm_head<T>(0, false, sm, s_tok);
+        if (sampling) am_last = lm_head<T, true>(0, false, 4000, sm, s_tok);
+        else if (P.score == 2) am_last = lm_head<T, false, true>(0, false, 4000, sm, s_tok);
+        else am_last = lm_head<T>(0, false, 4000, sm, s_tok);
         tl = T;
     } else if (P.last) {
-        am_last = sampling ? lm_head<1, true>(T - 1, false, sm, s_tok) : lm_head<1>(T - 1, false, sm, s_tok);
+        am_last = sampling ? lm_head<1, true>(T - 1, false, 4000, sm, s_tok) : lm_head<1>(T - 1, false, 4000, sm, s_tok);
         tl = 1;
     } else {
         am_last = blockIdx.x == 0;
@@ -1843,7 +2223,7 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
 
 // one MTP pass over R consecutive positions; rows read from ctl (catch-up) or a draft row.
 template <int R>
-__device__ __noinline__ void mtp_pass(int row0, bool draft_row, int draft_idx, bool logits, uint8_t * /*sm*/, unsigned & epoch) {
+__device__ __noinline__ void mtp_pass(int row0, bool draft_row, int draft_idx, bool logits, int p, uint8_t * /*sm*/, unsigned & epoch) {
     uint8_t * const sm = smem;
     volatile Ctl * vc = cB.ctl;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -1860,10 +2240,10 @@ __device__ __noinline__ void mtp_pass(int row0, bool draft_row, int draft_idx, b
         float * se = reinterpret_cast<float *>(sm);
         float * sh = se + D;
         float * red = sh + D;
-        const uint8_t * erow = cW.embd + (size_t) tok * (D / 256 * 144);
+        const uint8_t * erow = cW.embd + (size_t) tok * cW.embd_rb;
         float ae = 0.f, ah = 0.f;
         for (int e = tid; e < D; e += NT) {
-            const float v = dequant_q4k(erow, e);
+            const float v = dequant_elem(erow, cW.embd_type, e);
             const float hv = hsrc ? __ldcg(hsrc + e) : 0.f;
             se[e] = v;
             sh[e] = hv;
@@ -1873,15 +2253,25 @@ __device__ __noinline__ void mtp_pass(int row0, bool draft_row, int draft_idx, b
         ae = bsum(ae, red);
         ah = bsum(ah, red + 16);
         const float rse = rsqrtf(ae / (float) D + EPS), rsh = rsqrtf(ah / (float) D + EPS);
+#if MK_TP > 1
+        // eh_proj is K-split: rank 0 holds the enorm(embed) columns, rank 1 the hnorm(h) columns
+        for (int j = warp; j < U_D; j += NW) {
+            const int e = 32 * j + lane;
+            const float v = cB.rank == 0 ? se[e] * rse * cW.enorm[e] : sh[e] * rsh * cW.hnorm[e];
+            q32_store(cB.qe, r, j, v, 0.f, false);
+        }
+#else
         for (int j = warp; j < 2 * U_D; j += NW) {
             const int e = 32 * (j % U_D) + lane;
             const float v = j < U_D ? se[e] * rse * cW.enorm[e] : sh[e] * rsh * cW.hnorm[e];
             q32_store(cB.qe, r, j, v, 0.f, false);
         }
+#endif
     }
     gsync(epoch, PH_MTP_M0);
     const LayerW & W = cW.L[NL];
-    resid32<R, 10, T_Q8_0>(cW.eh, cB.qe, cB.xm, false, W.attn_norm, sm);
+    const int k0 = 128 + 3 * p; // eh | o | fd of pass p; p <= 8 here, so k stays far below the 4096 tag bound
+    resid32_t<R, U_EH_L / 32>(cW.eh.type, cW.eh, cB.qe, cB.xm, false, W.attn_norm, sm, k0);
     gsync(epoch, PH_MTP_EH);
     attn_proj<R>(W, 16, pos0, sm);
     gsync(epoch, PH_MTP_ATTN_PROJ);
@@ -1889,17 +2279,16 @@ __device__ __noinline__ void mtp_pass(int row0, bool draft_row, int draft_idx, b
     gsync(epoch, PH_MTP_ATTN_CORE);
     attn_combine<R>(pos0);
     gsync(epoch, PH_MTP_ATTN_COMB);
-    resid32<R, 6, T_Q4K>(W.o, cB.qo, cB.xm, true, W.post_norm, sm);
+    resid32_t<R, U_VD_L / 32>(W.o.type, W.o, cB.qo, cB.xm, true, W.post_norm, sm, k0 + 1);
     gsync(epoch, PH_MTP_RESID_O);
     ffn_gu<R>(W, sm);
     gsync(epoch, PH_MTP_FFN_GU);
-    if (W.fd.type == T_Q6K) resid32<R, 17, T_Q6K>(W.fd, cB.qa, cB.xm, true, cW.shnorm, sm);
-    else resid32<R, 17, T_Q4K>(W.fd, cB.qa, cB.xm, true, cW.shnorm, sm);
+    resid32_t<R, U_FF_L / 32>(W.fd.type, W.fd, cB.qa, cB.xm, true, cW.shnorm, sm, k0 + 2);
     gsync(epoch, PH_MTP_FFN_DOWN);
     if (logits) {
         write_h_rows<R>(cB.xm, cB.qn, cW.shnorm, cB.hm, 0, false, sm);
         int * s_tok = reinterpret_cast<int *>(misc(sm) + 400);
-        if (lm_head<1>(R - 1, true, sm, s_tok) && threadIdx.x == 0) {
+        if (lm_head<1>(R - 1, true, 4001 + p, sm, s_tok) && threadIdx.x == 0) {
             cB.ctl->tok[1 + (draft_row ? draft_idx : 0)] = s_tok[0];
             __threadfence();
         }
@@ -1921,8 +2310,7 @@ __device__ void bench_phase(int which, int layer, uint8_t * /*sm*/, unsigned & e
         const LayerW & W = cW.L[L];
         if (which == 0) ffn_gu<T>(W, sm);
         else if (which == 1) {
-            if (W.fd.type == T_Q6K) resid32<T, 17, T_Q6K>(W.fd, cB.qa, cB.x, true, W.attn_norm, sm);
-            else resid32<T, 17, T_Q4K>(W.fd, cB.qa, cB.x, true, W.attn_norm, sm);
+            resid32_t<T, U_FF_L / 32>(W.fd.type, W.fd, cB.qa, cB.x, true, W.attn_norm, sm, 2 * L + 1);
         } else if (which == 2) {
             if (!W.attn) dn_proj<T>(W, 0, 0, 0, sm);
         }
@@ -1956,27 +2344,35 @@ __global__ void __launch_bounds__(NT, 1) mk_cycle(Launch P) {
     const int Rtot = vc->mtp_R;
     const bool lg = vc->mtp_logits;
     int done = 0;
+    int p = 0; // MTP pass index; the pass's reductions take k = 128 + 3 * p + {0, 1, 2}
     while (done < Rtot) {
         const int R = min(MAXT, Rtot - done);
         const bool last_pass = done + R == Rtot;
         const bool want = lg && last_pass && P.ndraft > 0;
         switch (R) {
-            case 1: mtp_pass<1>(done, false, 0, want, sm, epoch); break;
-            case 2: mtp_pass<2>(done, false, 0, want, sm, epoch); break;
-            case 3: mtp_pass<3>(done, false, 0, want, sm, epoch); break;
-            case 4: mtp_pass<4>(done, false, 0, want, sm, epoch); break;
-            case 5: mtp_pass<5>(done, false, 0, want, sm, epoch); break;
+            case 1: mtp_pass<1>(done, false, 0, want, p, sm, epoch); break;
+            case 2: mtp_pass<2>(done, false, 0, want, p, sm, epoch); break;
+            case 3: mtp_pass<3>(done, false, 0, want, p, sm, epoch); break;
+            case 4: mtp_pass<4>(done, false, 0, want, p, sm, epoch); break;
+            case 5: mtp_pass<5>(done, false, 0, want, p, sm, epoch); break;
         }
         done += R;
+        p++;
     }
     if (lg) {
-        for (int i = 1; i < P.ndraft; i++) mtp_pass<1>(0, true, i, true, sm, epoch);
+        for (int i = 1; i < P.ndraft; i++) {
+            mtp_pass<1>(0, true, i, true, p, sm, epoch);
+            p++;
+        }
     }
 }
 
-__global__ void gather_rows(const uint8_t * src, uint8_t * dst, const __half * dsrc, __half * ddst, const int * ids,
-                            int rb, int nd) {
-    const int r = blockIdx.x, id = ids[r];
+// ids are global; src0 / src1 hold the output rows of vocab half 0 / 1 (the peer card's for the other half)
+__global__ void gather_rows(const uint8_t * src0, const __half * dsrc0, const uint8_t * src1, const __half * dsrc1,
+                            uint8_t * dst, __half * ddst, const int * ids, int rb, int nd) {
+    const int r = blockIdx.x, owner = ids[r] / VOCAB_L, id = ids[r] - owner * VOCAB_L;
+    const uint8_t * src = owner ? src1 : src0;
+    const __half * dsrc = owner ? dsrc1 : dsrc0;
     for (int i = threadIdx.x; i < rb / 16; i += blockDim.x)
         reinterpret_cast<int4 *>(dst + (size_t) r * rb)[i] = reinterpret_cast<const int4 *>(src + (size_t) id * rb)[i];
     for (int i = threadIdx.x; i < nd; i += blockDim.x) ddst[(size_t) r * nd + i] = dsrc[(size_t) id * nd + i];
@@ -2005,9 +2401,48 @@ void parallel_rows(int64_t n, F f) {
     for (auto & t : th) t.join();
 }
 
+// Card of tensor-parallel rank r: MK_DEVICES="a,b" or devices 0, 1.
+int mk_device(int rank) {
+    const char * s = getenv("MK_DEVICES");
+    if (!s) return rank;
+    int d[2] = {0, 1};
+    if (sscanf(s, "%d,%d", &d[0], &d[1]) < MK_TP) throw std::runtime_error("MK_DEVICES must list one device per rank, e.g. 0,1");
+    return d[rank];
+}
+
+// Host barrier of the two per-card prefill threads; breaks (throws) for everyone once a thread fails.
+struct HostBarrier {
+    std::mutex m;
+    std::condition_variable cv;
+    int n, waiting = 0;
+    unsigned long phase = 0;
+    bool broken = false;
+    explicit HostBarrier(int n_) : n(n_) {}
+    void wait() {
+        std::unique_lock<std::mutex> lk(m);
+        if (broken) throw std::runtime_error("prefill: the other card's thread failed");
+        const unsigned long ph = phase;
+        if (++waiting == n) { waiting = 0; phase++; cv.notify_all(); return; }
+        cv.wait(lk, [&] { return phase != ph || broken; });
+        if (phase == ph) throw std::runtime_error("prefill: the other card's thread failed");
+    }
+    void abort() {
+        std::lock_guard<std::mutex> lk(m);
+        broken = true;
+        cv.notify_all();
+    }
+};
+
 } // namespace
 
 struct MKEngine::Impl {
+    // TP > 1: one Impl per card; rank 0 (the engine's) owns rank 1's and drives both.
+    int rank = 0, dev = 0;
+    Impl * peer = nullptr;
+    std::unique_ptr<Impl> sub;
+    std::shared_ptr<HostBarrier> hbar;
+    unsigned gen = 0; // launch generation, folded into the cross-card flag tags
+    void use() const { CK(cudaSetDevice(dev)); }
     gguf::File file;
     ModelW hw{};
     Bufs hb{};
@@ -2027,7 +2462,9 @@ struct MKEngine::Impl {
     Ctl ck_ctl;
     int ck_pos = -1;
     void ck_save() {
-        const size_t ns = (size_t) 48 * NVH * 128 * 128, nc = (size_t) 48 * CONV_RING * QKV, nh = (size_t) H_RING * D;
+        if (sub) sub->ck_save();
+        use();
+        const size_t ns = (size_t) 48 * NVH_L * 128 * 128, nc = (size_t) 48 * CONV_RING * QKV_L, nh = (size_t) H_RING * D;
         if (!ck_dstate) {
             ck_dstate = dalloc<float>(ns, false);
             ck_conv = dalloc<float>(nc, false);
@@ -2040,7 +2477,9 @@ struct MKEngine::Impl {
         ck_pos = ck_ctl.dn_c;
     }
     void ck_restore() {
-        const size_t ns = (size_t) 48 * NVH * 128 * 128, nc = (size_t) 48 * CONV_RING * QKV, nh = (size_t) H_RING * D;
+        if (sub) sub->ck_restore();
+        use();
+        const size_t ns = (size_t) 48 * NVH_L * 128 * 128, nc = (size_t) 48 * CONV_RING * QKV_L, nh = (size_t) H_RING * D;
         CK(cudaMemcpy(hb.dstate, ck_dstate, ns * 4, cudaMemcpyDeviceToDevice));
         CK(cudaMemcpy(hb.conv, ck_conv, nc * 4, cudaMemcpyDeviceToDevice));
         CK(cudaMemcpy(hb.h_hist, ck_hhist, nh * 4, cudaMemcpyDeviceToDevice));
@@ -2056,10 +2495,12 @@ struct MKEngine::Impl {
 
     // Adds the tokens not yet in the draft head's vocabulary (copies their lm_head rows).
     void dv_add(const int * toks, size_t n) {
+        if (sub) sub->dv_add(toks, n);
         if (dv_in.empty()) return; // full-vocabulary draft head
+        use();
         const int n0 = (int) dv_ids.size();
         for (size_t i = 0; i < n && (int) dv_ids.size() < dv_base + DV_EXTRA - 1; i++)
-            if (!dv_in[toks[i]]) {
+            if (toks[i] % MK_TP == rank && !dv_in[toks[i]]) {
                 dv_in[toks[i]] = 1;
                 dv_ids.push_back(toks[i]);
             }
@@ -2068,13 +2509,25 @@ struct MKEngine::Impl {
         const int k = (int) dv_ids.size() - n0;
         Mat & m = hw.head_d;
         CK(cudaMemcpy(const_cast<int *>(hw.draft_ids) + n0, dv_ids.data() + n0, k * 4, cudaMemcpyHostToDevice));
-        gather_rows<<<k, 256>>>(hw.head.w, const_cast<uint8_t *>(m.w) + (size_t) n0 * m.rb, hw.head.d,
-                                m.d ? const_cast<__half *>(m.d) + (size_t) n0 * m.nd : nullptr, hw.draft_ids + n0, m.rb, m.nd);
+        draft_gather(n0, k);
         m.N = (int) dv_ids.size();
         CK(cudaMemcpyToSymbol(cW, &m.N, sizeof(int), offsetof(ModelW, head_d) + offsetof(Mat, N)));
     }
+    // Copies head_d rows [n0, n0 + k) from the lm_head halves (the peer's over P2P for its half).
+    void draft_gather(int n0, int k) {
+        use();
+        const Impl * h0 = (rank == 0 || !peer) ? this : peer;
+        const Impl * h1 = (rank == 1 || !peer) ? this : peer;
+        const Mat & m = hw.head_d;
+        gather_rows<<<k, 256>>>(h0->hw.head.w, h0->hw.head.d, h1->hw.head.w, h1->hw.head.d,
+                                const_cast<uint8_t *>(m.w) + (size_t) n0 * m.rb,
+                                m.d ? const_cast<__half *>(m.d) + (size_t) n0 * m.nd : nullptr, hw.draft_ids + n0, m.rb, m.nd);
+        CK(cudaGetLastError());
+    }
     void dv_reset() {
+        if (sub) sub->dv_reset();
         if (dv_in.empty() || (int) dv_ids.size() == dv_base) return;
+        use();
         for (size_t i = dv_base; i < dv_ids.size(); i++) dv_in[dv_ids[i]] = 0;
         for (int i = 0; i < dv_base; i++) dv_in[dv_ids[i]] = 1; // a padding duplicate may have been cleared
         dv_ids.resize(dv_base);
@@ -2104,10 +2557,9 @@ struct MKEngine::Impl {
         return (T *) p;
     }
 
-    // A tensor of the file in the quant type `to` its kernel is built for. A plain
-    // `llama-quantize ... Q4_K_M` stores four roles as Q4_K that the kernels read as something
-    // else (ssm_out Q5_K, ssm_alpha / ssm_beta F32, nextn.eh_proj Q8_0): those are re-encoded here,
-    // dequantized and quantized again by ggml. 145 small tensors, a few seconds at load.
+    // A tensor of the file in the quant type `to` its kernel is built for. ssm_alpha / ssm_beta are
+    // folded to fp32 at load, so a file that stores them in any quant type still loads: they are
+    // dequantized here by ggml, a few seconds.
     struct Src {
         uint32_t type = 0;
         std::vector<uint64_t> ne;
@@ -2125,15 +2577,15 @@ struct MKEngine::Impl {
         s.ne = t.ne;
         s.data = t.data;
         s.nbytes = t.nbytes;
-        if ((int) t.type == to || t.type != gguf::Q4_K) return s; // any other mix is refused by need() below
+        if ((int) t.type == to || (to != T_F32 && t.type != gguf::Q4_K)) return s; // other mixes are refused by need() below
         const int64_t K = (int64_t) t.ne[0];
         int64_t rows = 1;
         for (size_t d = 1; d < t.ne.size(); d++) rows *= (int64_t) t.ne[d];
-        const size_t rs_from = ggml_row_size(GGML_TYPE_Q4_K, K), rs_to = ggml_row_size((ggml_type) to, K);
+        const size_t rs_from = ggml_row_size((ggml_type) t.type, K), rs_to = ggml_row_size((ggml_type) to, K);
         const auto t0 = std::chrono::steady_clock::now();
         s.own.resize(rs_to * (size_t) rows);
         if (to != T_F32) ggml_quantize_init((ggml_type) to);
-        const auto * tr = ggml_get_type_traits(GGML_TYPE_Q4_K);
+        const auto * tr = ggml_get_type_traits((ggml_type) t.type);
         parallel_rows(rows, [&](int64_t r) {
             thread_local std::vector<float> f;
             f.resize((size_t) K);
@@ -2149,6 +2601,64 @@ struct MKEngine::Impl {
         return s;
     }
 
+    // This card's part of a weight: row ranges and K-column ranges [first, count) of the GGUF tensor
+    // (block aligned), then zero rows / columns appended (zero bytes decode to 0 in every quant type).
+    struct Slice {
+        std::vector<std::pair<int, int>> rows, cols;
+        int pad_rows = 0, pad_cols = 0;
+    };
+    static Src slice(const Src & s, const Slice & sl) {
+        const int K = (int) s.ne[0], N = (int) s.ne[1];
+        const auto rows = sl.rows.empty() ? std::vector<std::pair<int, int>>{{0, N}} : sl.rows;
+        const auto cols = sl.cols.empty() ? std::vector<std::pair<int, int>>{{0, K}} : sl.cols;
+        const ggml_type ty = (ggml_type) s.type;
+        const int bs = (int) ggml_blck_size(ty);
+        int K2 = sl.pad_cols, N2 = sl.pad_rows;
+        for (const auto & c : cols) {
+            if (c.first % bs || c.second % bs || c.first + c.second > K) throw std::runtime_error("slice: K range not block aligned");
+            K2 += c.second;
+        }
+        for (const auto & r : rows) {
+            if (r.first + r.second > N) throw std::runtime_error("slice: row range out of bounds");
+            N2 += r.second;
+        }
+        if (sl.pad_cols % bs) throw std::runtime_error("slice: K padding not block aligned");
+        const size_t rs = ggml_row_size(ty, K), rs2 = ggml_row_size(ty, K2);
+        Src o;
+        o.type = s.type;
+        o.ne = {(uint64_t) K2, (uint64_t) N2};
+        o.own.assign(rs2 * (size_t) N2, 0);
+        size_t dr = 0;
+        for (const auto & r : rows)
+            for (int i = 0; i < r.second; i++, dr++) {
+                const uint8_t * src = s.data + (size_t) (r.first + i) * rs;
+                uint8_t * dst = o.own.data() + dr * rs2;
+                for (const auto & c : cols) {
+                    const size_t b = ggml_row_size(ty, c.second);
+                    memcpy(dst, src + ggml_row_size(ty, c.first), b);
+                    dst += b;
+                }
+            }
+        o.data = o.own.data();
+        o.nbytes = o.own.size();
+        return o;
+    }
+
+    // f32 tensor restricted to element ranges [first, count) (this card's heads / channels); empty: all
+    const float * up_f32_sel(const std::string & name, size_t expect, const std::vector<std::pair<int, int>> & sel) {
+        if (sel.empty()) return up_f32(name, expect);
+        const auto & t = file.get(name);
+        if (t.type != gguf::F32) throw std::runtime_error(name + " not f32");
+        if (t.nbytes / 4 != expect) throw std::runtime_error(name + " bad size");
+        const float * f = (const float *) t.data;
+        std::vector<float> v;
+        for (const auto & r : sel) v.insert(v.end(), f + r.first, f + r.first + r.second);
+        float * d = dalloc<float>(v.size(), false);
+        CK(cudaMemcpy(d, v.data(), v.size() * 4, cudaMemcpyHostToDevice));
+        wbytes += v.size() * 4;
+        return d;
+    }
+
     const float * up_f32(const std::string & name, size_t expect) {
         const auto & t = file.get(name);
         if (t.type != gguf::F32) throw std::runtime_error(name + " not f32");
@@ -2160,9 +2670,14 @@ struct MKEngine::Impl {
         return d;
     }
 
-    Mat up_mat(const std::string & name, int K, int N, int to = -1) {
-        const Src t = want(name, to < 0 ? (int) file.get(name).type : to);
+    Mat up_mat(const std::string & name, int K, int N, int to = -1, const Slice * sl = nullptr) {
+        Src t = want(name, to < 0 ? (int) file.get(name).type : to);
         if ((int) t.ne[0] != K || (int) t.ne[1] != N) throw std::runtime_error(name + " bad shape");
+        if (sl) {
+            t = slice(t, *sl);
+            K = (int) t.ne[0];
+            N = (int) t.ne[1];
+        }
         Mat m{};
         m.K = K;
         m.N = N;
@@ -2269,14 +2784,65 @@ struct MKEngine::Impl {
 
     int n_draft_max;
     int kv_mode; // KV cache format: 0 fp16, 1 q8_0, -1 auto (q8_0 when fp16 does not fit)
-    Impl(const std::string & path, int ctx_, int ndraft_, const std::string & draft_vocab, int kv_mode_)
-        : file(path), ctx(ctx_), ndraft(ndraft_), nd_avail(ndraft_), n_draft_max(ndraft_), kv_mode(kv_mode_) {
+    Impl(const std::string & path, int ctx_, int ndraft_, const std::string & draft_vocab, int kv_mode_, int rank_ = 0)
+        : rank(rank_), dev(mk_device(rank_)), file(path), ctx(ctx_), ndraft(ndraft_), nd_avail(ndraft_), n_draft_max(ndraft_),
+          kv_mode(kv_mode_) {
         if (file.strs["general.architecture"] != "qwen35") throw std::runtime_error("expected qwen35 architecture");
         if (file.ints["qwen35.block_count"] != NLA || file.ints["qwen35.embedding_length"] != D)
             throw std::runtime_error("unexpected model dimensions (this kernel is specialised for the 27B)");
+#if MK_TP > 1
+        if (rank == 0) {
+            const int d1 = mk_device(1);
+            int a = 0, b = 0;
+            if (d1 != dev) {
+                CK(cudaDeviceCanAccessPeer(&a, dev, d1));
+                CK(cudaDeviceCanAccessPeer(&b, d1, dev));
+            }
+            if (!a || !b)
+                throw std::runtime_error("TP=2 needs two distinct GPUs with peer-to-peer access both ways (devices " +
+                                         std::to_string(dev) + ", " + std::to_string(d1) + ")");
+            CK(cudaSetDevice(d1));
+            CK(cudaDeviceEnablePeerAccess(dev, 0));
+            CK(cudaSetDevice(dev));
+            CK(cudaDeviceEnablePeerAccess(d1, 0));
+        }
+#endif
+        use();
+        if (rank) pf_prof = false;
         cudaDeviceProp prop;
-        CK(cudaGetDeviceProperties(&prop, 0));
+        CK(cudaGetDeviceProperties(&prop, dev));
         nsm = prop.multiProcessorCount;
+
+        // TP > 1: this card's rows / K columns of each sharded weight (design: README, tensor parallel).
+        // Delta-net value heads are interleaved: card r owns {h : (h % 16) / 8 == r}, so the local
+        // value head hl -> h = (hl / 8) * 16 + 8 r + hl % 8 keeps key head hl % 8 = (h % 16) - 8 r.
+        const bool tp = MK_TP > 1;
+        const int r = rank;
+        std::vector<std::pair<int, int>> vh, vrows;     // owned value heads; their 128-row blocks
+        for (int g = 0; g < NVH / 16 && tp; g++) {
+            vh.push_back({g * 16 + 8 * r, 8});
+            vrows.push_back({(g * 16 + 8 * r) * HK, 8 * HK});
+        }
+        Slice s_q, s_kv, s_o, s_qkv, s_gate, s_sout, s_gu, s_down, s_eh, s_head;
+        std::vector<std::pair<int, int>> conv_sel;
+        if (tp) {
+            s_q.rows = {{r * QG_L, QG_L}};
+            s_kv.rows = {{r * KVD_L, KVD_L}};
+            s_o.cols = {{r * VD_L, VD_L}};
+            s_qkv.rows = {{r * NKH_L * HK, NKH_L * HK}, {NKH * HK + r * NKH_L * HK, NKH_L * HK}};
+            for (const auto & v : vrows) s_qkv.rows.push_back({2 * NKH * HK + v.first, v.second});
+            s_gate.rows = vrows;
+            s_sout.cols = vrows;
+            for (const auto & c : s_qkv.rows) conv_sel.push_back({4 * c.first, 4 * c.second});
+            const int ffc = FF / MK_TP; // 8704 = 34 super-blocks; padded to FF_L with zero rows / columns
+            s_gu.rows = {{r * ffc, ffc}};
+            s_gu.pad_rows = FF_L - ffc;
+            s_down.cols = {{r * ffc, ffc}};
+            s_down.pad_cols = FF_L - ffc;
+            s_eh.cols = {{r * D, D}};
+            s_head.rows = {{r * VOCAB_L, VOCAB_L}};
+        }
+        auto S = [&](const Slice & x) { return tp ? &x : nullptr; };
 
         auto blk = [](int i, const char * s) { return "blk." + std::to_string(i) + "." + s; };
         // The decode kernels are compiled for one quant type per tensor role (resid32 / gemv_pairs
@@ -2294,6 +2860,7 @@ struct MKEngine::Impl {
                 default: return "type " + std::to_string(t);
             }
         };
+        const std::initializer_list<int> kquant = {T_Q4K, T_Q5K, T_Q6K, T_Q8_0};
         auto need = [&](const std::string & name, int got, std::initializer_list<int> ok) {
             for (int t : ok)
                 if (got == t) return;
@@ -2309,26 +2876,26 @@ struct MKEngine::Impl {
             L.attn_norm = up_f32(blk(i, "attn_norm.weight"), D);
             L.post_norm = up_f32(blk(i, "post_attention_norm.weight"), D);
             if (L.attn) {
-                L.q = up_mat(blk(i, "attn_q.weight"), D, QG);
-                L.k = up_mat(blk(i, "attn_k.weight"), D, KVD);
-                L.v = up_mat(blk(i, "attn_v.weight"), D, KVD);
-                L.o = up_mat(blk(i, "attn_output.weight"), VD, D);
-                need(blk(i, "attn_q.weight"), L.q.type, {T_Q4K});
-                need(blk(i, "attn_k.weight"), L.k.type, {T_Q4K});
-                need(blk(i, "attn_v.weight"), L.v.type, {T_Q4K, T_Q6K});
-                need(blk(i, "attn_output.weight"), L.o.type, {T_Q4K});
+                L.q = up_mat(blk(i, "attn_q.weight"), D, QG, -1, S(s_q));
+                L.k = up_mat(blk(i, "attn_k.weight"), D, KVD, -1, S(s_kv));
+                L.v = up_mat(blk(i, "attn_v.weight"), D, KVD, -1, S(s_kv));
+                L.o = up_mat(blk(i, "attn_output.weight"), VD, D, -1, S(s_o));
+                need(blk(i, "attn_q.weight"), L.q.type, kquant);
+                need(blk(i, "attn_k.weight"), L.k.type, kquant);
+                need(blk(i, "attn_v.weight"), L.v.type, kquant);
+                need(blk(i, "attn_output.weight"), L.o.type, kquant);
                 L.qn = up_f32(blk(i, "attn_q_norm.weight"), HD);
                 L.kn = up_f32(blk(i, "attn_k_norm.weight"), HD);
             } else {
-                L.qkv = up_mat(blk(i, "attn_qkv.weight"), D, QKV);
-                L.gate = up_mat(blk(i, "attn_gate.weight"), D, VD);
-                L.sout = up_mat(blk(i, "ssm_out.weight"), VD, D, T_Q5K);
-                need(blk(i, "attn_qkv.weight"), L.qkv.type, {T_Q4K, T_Q6K});
-                need(blk(i, "attn_gate.weight"), L.gate.type, {T_Q4K});
-                need(blk(i, "ssm_out.weight"), L.sout.type, {T_Q5K});
-                L.conv = up_f32(blk(i, "ssm_conv1d.weight"), 4 * QKV);
-                L.dt = up_f32(blk(i, "ssm_dt.bias"), NVH);
-                L.A = up_f32(blk(i, "ssm_a"), NVH);
+                L.qkv = up_mat(blk(i, "attn_qkv.weight"), D, QKV, -1, S(s_qkv));
+                L.gate = up_mat(blk(i, "attn_gate.weight"), D, VD, -1, S(s_gate));
+                L.sout = up_mat(blk(i, "ssm_out.weight"), VD, D, -1, S(s_sout));
+                need(blk(i, "attn_qkv.weight"), L.qkv.type, kquant);
+                need(blk(i, "attn_gate.weight"), L.gate.type, kquant);
+                need(blk(i, "ssm_out.weight"), L.sout.type, kquant);
+                L.conv = up_f32_sel(blk(i, "ssm_conv1d.weight"), 4 * QKV, conv_sel);
+                L.dt = up_f32_sel(blk(i, "ssm_dt.bias"), NVH, vh);
+                L.A = up_f32_sel(blk(i, "ssm_a"), NVH, vh);
                 L.snorm = up_f32(blk(i, "ssm_norm.weight"), HK);
                 // alpha/beta projections in fp32 with the attn_norm weight folded in
                 const Src ta = want(blk(i, "ssm_alpha.weight"), T_F32);
@@ -2339,46 +2906,55 @@ struct MKEngine::Impl {
                 need(blk(i, "ssm_beta.weight"), (int) tb.type, {T_F32});
                 if (ta.ne[0] != D || ta.ne[1] != NVH || tb.ne[0] != D || tb.ne[1] != NVH)
                     throw std::runtime_error(blk(i, "ssm_alpha/beta.weight") + " bad shape");
-                std::vector<float> ab((size_t) 2 * NVH * D);
+                std::vector<float> ab((size_t) 2 * NVH_L * D);
                 const float * fa = (const float *) ta.data;
                 const float * fb = (const float *) tb.data;
                 const float * fn = (const float *) tn.data;
-                for (int h = 0; h < NVH; h++)
+                for (int hl = 0; hl < NVH_L; hl++) {
+                    const int h = tp ? (hl / 8) * 16 + 8 * r + hl % 8 : hl;
                     for (int e = 0; e < D; e++) {
-                        ab[(size_t) h * D + e] = fa[(size_t) h * D + e] * fn[e];
-                        ab[(size_t) (NVH + h) * D + e] = fb[(size_t) h * D + e] * fn[e];
+                        ab[(size_t) hl * D + e] = fa[(size_t) h * D + e] * fn[e];
+                        ab[(size_t) (NVH_L + hl) * D + e] = fb[(size_t) h * D + e] * fn[e];
                     }
+                }
                 float * d = dalloc<float>(ab.size(), false);
                 CK(cudaMemcpy(d, ab.data(), ab.size() * 4, cudaMemcpyHostToDevice));
                 L.ab = d;
                 wbytes += ab.size() * 4;
             }
-            L.fg = up_mat(blk(i, "ffn_gate.weight"), D, FF);
-            L.fu = up_mat(blk(i, "ffn_up.weight"), D, FF);
-            L.fd = up_mat(blk(i, "ffn_down.weight"), FF, D);
-            if (L.fg.type != T_Q4K || L.fu.type != T_Q4K) throw std::runtime_error("ffn gate/up must be Q4_K");
-            need(blk(i, "ffn_down.weight"), L.fd.type, {T_Q4K, T_Q6K});
+            L.fg = up_mat(blk(i, "ffn_gate.weight"), D, FF, -1, S(s_gu));
+            L.fu = up_mat(blk(i, "ffn_up.weight"), D, FF, -1, S(s_gu));
+            L.fd = up_mat(blk(i, "ffn_down.weight"), FF, D, -1, S(s_down));
+            need(blk(i, "ffn_gate.weight"), L.fg.type, kquant);
+            need(blk(i, "ffn_up.weight"), L.fu.type, kquant);
+            if (L.fg.type != L.fu.type)
+                throw std::runtime_error("blk " + std::to_string(i) + " ffn gate/up have different types: " +
+                                         tname(L.fg.type) + " vs " + tname(L.fu.type));
+            need(blk(i, "ffn_down.weight"), L.fd.type, kquant);
         }
-        hw.eh = up_mat(blk(NL, "nextn.eh_proj.weight"), 2 * D, D, T_Q8_0);
-        need(blk(NL, "nextn.eh_proj.weight"), hw.eh.type, {T_Q8_0});
+        hw.eh = up_mat(blk(NL, "nextn.eh_proj.weight"), 2 * D, D, -1, S(s_eh));
+        need(blk(NL, "nextn.eh_proj.weight"), hw.eh.type, kquant);
         hw.enorm = up_f32(blk(NL, "nextn.enorm.weight"), D);
         hw.hnorm = up_f32(blk(NL, "nextn.hnorm.weight"), D);
         hw.shnorm = up_f32(blk(NL, "nextn.shared_head_norm.weight"), D);
         hw.onorm = up_f32("output_norm.weight", D);
-        hw.head = up_mat("output.weight", D, VOCAB);
-        if (hw.head.type != T_Q6K) throw std::runtime_error("output.weight must be Q6_K");
+        hw.head = up_mat("output.weight", D, VOCAB, -1, S(s_head));
+        need("output.weight", hw.head.type, kquant);
         hw.head_d = hw.head;
         hw.draft_ids = nullptr;
         if (!draft_vocab.empty()) {
             FILE * f = fopen(draft_vocab.c_str(), "rb");
             if (!f) throw std::runtime_error("cannot open draft vocab " + draft_vocab);
-            std::vector<int> ids;
+            std::vector<int> all, ids;
             int id;
             while (fread(&id, 4, 1, f) == 1) {
                 if (id < 0 || id >= VOCAB) throw std::runtime_error("bad id in draft vocab");
-                ids.push_back(id);
+                all.push_back(id);
             }
             fclose(f);
+            // every MK_TP-th entry so both cards draft over equally many rows; tokens added later go
+            // to the card of their id parity (dv_add)
+            for (size_t i = rank; i < all.size(); i += MK_TP) ids.push_back(all[i]);
             if (ids.size() & 1) ids.push_back(ids.back());
             // room for DV_EXTRA more rows: tokens of the current sequence that are not in the list
             // are added on the fly (identifiers of pasted code, see dv_add)
@@ -2389,46 +2965,48 @@ struct MKEngine::Impl {
             m.N = (int) ids.size();
             uint8_t * w = dalloc<uint8_t>((size_t) cap * m.rb, false);
             __half * d = m.nd ? dalloc<__half>((size_t) cap * m.nd, false) : nullptr;
-            gather_rows<<<m.N, 256>>>(hw.head.w, w, hw.head.d, d, did, m.rb, m.nd);
-            CK(cudaDeviceSynchronize());
             m.w = w;
             m.d = d;
             hw.head_d = m;
             hw.draft_ids = did;
             dv_ids = ids;
             dv_base = (int) ids.size();
+            if (MK_TP == 1 && m.N) draft_gather(0, m.N); // TP=2 gathers once the peer exists
+            CK(cudaDeviceSynchronize());
             dv_in.assign(VOCAB, 0);
-            for (int t : ids) dv_in[t] = 1;
+            for (int t : all) dv_in[t] = 1; // also the other card's base rows, so dv_add never duplicates them
             fprintf(stderr, "[mk] MTP draft head restricted to %d tokens (%s)\n", m.N, draft_vocab.c_str());
         }
         {
             const auto & t = file.get("token_embd.weight");
-            if (t.type != gguf::Q4_K) throw std::runtime_error("token_embd must be Q4_K");
+            need("token_embd.weight", (int) t.type, kquant);
+            hw.embd_type = (int) t.type;
+            hw.embd_rb = (int) ggml_row_size((ggml_type) t.type, D);
             uint8_t * d = dalloc<uint8_t>(t.nbytes, false);
             CK(cudaMemcpy(d, t.data, t.nbytes, cudaMemcpyHostToDevice));
             hw.embd = d;
         }
         CK(cudaMemcpyToSymbol(cW, &hw, sizeof(ModelW)));
         if (n_conv)
-            fprintf(stderr, "[mk] %d tensors re-encoded in %.0f s: a plain Q4_K_M quant mix, not the one the kernels are built for "
+            fprintf(stderr, "[mk] %d ssm alpha/beta tensors converted to F32 in %.0f s; quantized weights accept Q4_K, Q5_K, Q6_K or Q8_0 "
                             "(README: the GGUF)\n", n_conv, conv_s);
 
         hb.x = dalloc<float>(MAXT * D);
         hb.xm = dalloc<float>(MAXT * D);
         hb.qn = qbuf(U_D);
-        hb.qo = qbuf(U_VD);
-        hb.qa = qbuf(U_FF);
-        hb.qe = qbuf(U_EH);
-        hb.z = dalloc<float>(MAXT * VD);
-        hb.ab = dalloc<float>(AB_SPLIT * MAXT * 2 * NVH);
-        hb.qbuf = dalloc<float>(MAXT * QG);
-        hb.kbuf = dalloc<float>(MAXT * KVD);
-        hb.vbuf = dalloc<float>(MAXT * KVD);
-        hb.conv = dalloc<float>((size_t) 48 * CONV_RING * QKV);
-        hb.kvgb = dalloc<float>((size_t) 48 * KV_RING * KVGB);
-        hb.dstate = dalloc<float>((size_t) 48 * NVH * 128 * 128);
+        hb.qo = qbuf(U_VD_L);
+        hb.qa = qbuf(U_FF_L);
+        hb.qe = qbuf(U_EH_L);
+        hb.z = dalloc<float>(MAXT * VD_L);
+        hb.ab = dalloc<float>(AB_SPLIT * MAXT * 2 * NVH_L);
+        hb.qbuf = dalloc<float>(MAXT * QG_L);
+        hb.kbuf = dalloc<float>(MAXT * KVD_L);
+        hb.vbuf = dalloc<float>(MAXT * KVD_L);
+        hb.conv = dalloc<float>((size_t) 48 * CONV_RING * QKV_L);
+        hb.kvgb = dalloc<float>((size_t) 48 * KV_RING * KVGB_L);
+        hb.dstate = dalloc<float>((size_t) 48 * NVH_L * 128 * 128);
         {
-            const size_t rows = (size_t) N_ATT_SLOTS * NKV * ctx;
+            const size_t rows = (size_t) N_ATT_SLOTS * NKV_L * ctx;
             size_t free_b = 0, total_b = 0;
             CK(cudaMemGetInfo(&free_b, &total_b));
             // fp16 needs 2 x rows x HD x 2 bytes; leave ~1.5 GB for the prefill buffers, checkpoint and runtime
@@ -2441,8 +3019,8 @@ struct MKEngine::Impl {
             fprintf(stderr, "[mk] KV cache %s, %.2f GB for %d positions\n", q8 ? "q8_0" : "fp16",
                     rows * HD * (q8 ? 2.0 + 2.0 * 2 / 32 : 4.0) / 1e9, ctx);
         }
-        hb.apart = dalloc<float>((size_t) NKV * MAX_CH * AR * 256);
-        hb.aml = dalloc<float2>((size_t) NKV * MAX_CH * AR);
+        hb.apart = dalloc<float>((size_t) NKV_L * MAX_CH * AR * 256);
+        hb.aml = dalloc<float2>((size_t) NKV_L * MAX_CH * AR);
         hb.h_hist = dalloc<float>((size_t) H_RING * D);
         {
             std::vector<float2> rt((size_t) ctx * 32);
@@ -2458,33 +3036,115 @@ struct MKEngine::Impl {
         hb.hm = dalloc<float>(D);
         hb.blk_best = dalloc<float2>((size_t) nsm * MAXT * TOPK_MAX);
         hb.cand = dalloc<float2>((size_t) MAXT * TOPK_MAX);
-        hb.logits = dalloc<float>((size_t) MAXT * VOCAB);
+        hb.logits = dalloc<float>((size_t) MAXT * VOCAB_L);
         hb.bar = dalloc<unsigned>(4);
         hb.cnt = dalloc<unsigned>(4);
         hb.ctl = dalloc<Ctl>(1);
         hb.ctx = ctx;
         profiling = getenv("MK_PROFILE") != nullptr;
         hb.prof = profiling ? dalloc<unsigned long long>(4096 + 1024 * 128) : nullptr;
+#if MK_TP > 1
+        // flags are zeroed once here and never per launch: tags carry the launch generation
+        hb.rank = rank;
+        for (auto & b : hb.xr) b = dalloc<float>((size_t) D * MAXT);
+        hb.fl = dalloc<unsigned>(D / 32);
+        hb.lx = dalloc<float2>((size_t) MAXT * TOPK_MAX);
+        hb.lfl = dalloc<unsigned>(1);
+#endif
         CK(cudaMemcpyToSymbol(cB, &hb, sizeof(Bufs)));
 
         CK(cudaFuncSetAttribute(mk_cycle, cudaFuncAttributeMaxDynamicSharedMemorySize, SM_TOTAL));
         int nb = 0;
         CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, mk_cycle, NT, SM_TOTAL));
         if (nb < 1) throw std::runtime_error("megakernel does not fit on an SM");
-        fprintf(stderr, "[mk] weights %.2f GB on device, %d SMs, ctx %d, n_draft %d\n", wbytes / 1e9, nsm, ctx, ndraft);
+        fprintf(stderr, "[mk] weights %.2f GB on device %d (TP rank %d of %d), %d SMs, ctx %d, n_draft %d\n", wbytes / 1e9, dev,
+                rank, MK_TP, nsm, ctx, ndraft);
+#if MK_TP > 1
+        if (rank == 0) {
+            sub = std::make_unique<Impl>(path, ctx_, ndraft_, draft_vocab, kv_mode_, 1);
+            if (sub->nsm != nsm) throw std::runtime_error("TP=2 needs two GPUs with the same SM count (equal grids)");
+            peer = sub.get();
+            sub->peer = this;
+            hbar = std::make_shared<HostBarrier>(MK_TP);
+            sub->hbar = hbar;
+            for (Impl * e : {this, peer}) {
+                const Impl * o = e->peer;
+                for (int i = 0; i < 2; i++) e->hb.peer_xr[i] = o->hb.xr[i];
+                e->hb.peer_fl = o->hb.fl;
+                e->hb.peer_lx = o->hb.lx;
+                e->hb.peer_lfl = o->hb.lfl;
+                e->use();
+                CK(cudaMemcpyToSymbol(cB, &e->hb, sizeof(Bufs)));
+            }
+            for (Impl * e : {this, peer})
+                if (e->hw.draft_ids && e->hw.head_d.N) {
+                    e->draft_gather(0, e->hw.head_d.N);
+                    CK(cudaDeviceSynchronize());
+                }
+            use();
+        }
+#endif
     }
 
     ~Impl() {
+        sub.reset();
+        use();
         print_profile();
+        for (cudaEvent_t e : ev_done)
+            if (e) cudaEventDestroy(e);
         for (void * p : allocs) cudaFree(p);
     }
 
-    void launch(int mode, int T, int last, int score = 0) {
-        Launch L{mode, T, last, ndraft, score, smp_temp, smp_top_p, smp_min_p, smp_top_k, smp_seed};
-        void * args[] = {&L};
+    // One cooperative launch per card, back to back with no blocking call between them: the cards
+    // wait on each other's flags inside the kernel.
+    void coop(Launch & P) {
+#if MK_TP > 1
+        P.gen = ++gen; // starts at 1, so the zeroed flags never match a tag
+        for (Impl * e : {this, peer}) {
+            e->use();
+            CK(cudaMemcpyToSymbolAsync(L, &P, sizeof(Launch), 0, cudaMemcpyHostToDevice, 0));
+            CK(cudaMemsetAsync(e->hb.bar, 0, 16));
+            void * args[] = {&P};
+            CK(cudaLaunchCooperativeKernel((void *) mk_cycle, dim3(nsm), dim3(NT), args, SM_TOTAL, 0));
+        }
+        use();
+#else
+        void * args[] = {&P};
         CK(cudaMemsetAsync(hb.bar, 0, 16));
-        if (profiling) CK(cudaMemsetAsync(hb.prof, 0, (4096 + 1024 * 128) * 8));
         CK(cudaLaunchCooperativeKernel((void *) mk_cycle, dim3(nsm), dim3(NT), args, SM_TOTAL, 0));
+#endif
+    }
+
+    // host -> every card's Ctl (the cards keep identical copies); reads come from rank 0 after both finished
+    void put_ctl(const Ctl & c) {
+        if (sub) sub->put_ctl(c);
+        use();
+        CK(cudaMemcpy(hb.ctl, &c, sizeof(Ctl), cudaMemcpyHostToDevice));
+    }
+    void get_ctl(Ctl & c) {
+        if (sub) {
+            sub->use();
+            CK(cudaDeviceSynchronize());
+        }
+        use();
+        CK(cudaMemcpy(&c, hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
+    }
+    // rows s .. s + n - 1 of the last scoring launch's logits, both vocab halves -> dst [n][VOCAB]
+    void get_logits(float * dst, int s, int n) {
+        for (int r = 0; r < MK_TP; r++) {
+            const Impl * e = r ? peer : this;
+            e->use();
+            CK(cudaMemcpy2D(dst + (size_t) r * VOCAB_L, (size_t) VOCAB * 4, e->hb.logits + (size_t) s * VOCAB_L, (size_t) VOCAB_L * 4,
+                            (size_t) VOCAB_L * 4, n, cudaMemcpyDeviceToHost));
+        }
+        use();
+    }
+
+    void launch(int mode, int T, int last, int score = 0) {
+        use();
+        Launch P{mode, T, last, ndraft, score, smp_temp, smp_top_p, smp_min_p, smp_top_k, smp_seed};
+        if (profiling) CK(cudaMemsetAsync(hb.prof, 0, (4096 + 1024 * 128) * 8));
+        coop(P);
         if (profiling && mode == MODE_DECODE) {
             std::vector<unsigned long long> pr(4096 + 1024 * 128);
             CK(cudaMemcpy(pr.data(), hb.prof, pr.size() * 8, cudaMemcpyDeviceToHost));
@@ -2564,17 +3224,16 @@ struct MKEngine::Impl {
     }
 
     void bench() {
+        use();
         const char * names[3] = {"ffn_gu", "ffn_down", "dn_proj"};
         if (profiling) {
             // i-cache test: 4 back-to-back iterations of one phase inside one launch
             for (int which = 0; which < 3; which++) {
                 std::vector<double> best(5, 1e30);
                 for (int rep = 0; rep < 60; rep++) {
-                    Launch L{MODE_BENCH, 4, which, which == 2 ? 0 : 1, 0};
-                    void * args[] = {&L};
-                    CK(cudaMemsetAsync(hb.bar, 0, 16));
+                    Launch P{MODE_BENCH, 4, which, which == 2 ? 0 : 1, 0};
                     CK(cudaMemsetAsync(hb.prof, 0, 4096 * 8));
-                    CK(cudaLaunchCooperativeKernel((void *) mk_cycle, dim3(nsm), dim3(NT), args, SM_TOTAL, 0));
+                    coop(P);
                     std::vector<unsigned long long> pr(8);
                     CK(cudaMemcpy(pr.data(), hb.prof, 8 * 8, cudaMemcpyDeviceToHost));
                     for (int k = 1; k <= 4; k++) best[k] = std::min(best[k], (double) ((pr[k] >> 8) - (pr[k - 1] >> 8)));
@@ -2592,10 +3251,8 @@ struct MKEngine::Impl {
                 cudaEventCreate(&b);
                 for (int rep = 0; rep < 400; rep++) {
                     cudaEventRecord(a);
-                    Launch L{MODE_BENCH, T, which, which == 2 ? 0 : (rep % 16), 0};
-                    void * args[] = {&L};
-                    CK(cudaMemsetAsync(hb.bar, 0, 16));
-                    CK(cudaLaunchCooperativeKernel((void *) mk_cycle, dim3(nsm), dim3(NT), args, SM_TOTAL, 0));
+                    Launch P{MODE_BENCH, T, which, which == 2 ? 0 : (rep % 16), 0};
+                    coop(P);
                     cudaEventRecord(b);
                     CK(cudaEventSynchronize(b));
                     float ms;
@@ -2609,6 +3266,8 @@ struct MKEngine::Impl {
     // ---------------- batched prefill (prefill.cuh) ----------------
     PBufs hp{};
     bool pf_ready = false;
+    cudaEvent_t ev_done[2] = {nullptr, nullptr}; // TP > 1: this card's partial GEMM output of a reduction is ready
+    int ar_n = 0;                                 // prefill reductions so far (selects the part / event buffer)
 
     void pf_init() {
         if (pf_ready) return;
@@ -2617,27 +3276,55 @@ struct MKEngine::Impl {
         hp.x = dalloc<float>((size_t) cap * D);
         hp.xm = dalloc<float>((size_t) cap * D);
         hp.rs = dalloc<float>(cap);
-        hp.xh = dalloc<__half>((size_t) cap * FF);
-        hp.xh2 = dalloc<__half>((size_t) cap * FF);
-        hp.y0 = dalloc<float>((size_t) cap * FF);
-        hp.y1 = dalloc<float>((size_t) cap * FF);
-        hp.y2 = dalloc<float>((size_t) cap * VD);
-        hp.dq = dalloc<__half>((size_t) cap * QKV);
-        hp.gb = dalloc<float>((size_t) cap * 2 * NVH);
-        hp.ab = dalloc<float>((size_t) 8 * cap * 2 * NVH);
+        hp.xh = dalloc<__half>((size_t) cap * FF_L);
+        hp.xh2 = dalloc<__half>((size_t) cap * FF_L);
+        hp.y0 = dalloc<float>((size_t) cap * FF_L);
+        hp.y1 = dalloc<float>((size_t) cap * FF_L);
+        hp.y2 = dalloc<float>((size_t) cap * VD_L);
+        hp.dq = dalloc<__half>((size_t) cap * QKV_L);
+        hp.gb = dalloc<float>((size_t) cap * 2 * NVH_L);
+        hp.ab = dalloc<float>((size_t) 8 * cap * 2 * NVH_L);
         hp.h = dalloc<float>((size_t) (cap + 1) * D);
-        hp.qh = dalloc<__half>((size_t) cap * NH * HD);
+        hp.qh = dalloc<__half>((size_t) cap * NH_L * HD);
         hp.tok = dalloc<int>(cap);
         hp.amax = dalloc<int>(cap);
+        hp.amaxv = dalloc<float>(cap);
+#if MK_TP > 1
+        for (int b = 0; b < 2; b++) {
+            hp.part[b] = dalloc<float>((size_t) cap * D);
+            CK(cudaEventCreateWithFlags(&ev_done[b], cudaEventDisableTiming));
+        }
+#endif
         CK(cudaMemcpyToSymbol(cP, &hp, sizeof(PBufs)));
         CK(cudaFuncSetAttribute(pf::mmh<pf::TQ4K>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ4K>()));
         CK(cudaFuncSetAttribute(pf::mmh<pf::TQ5K>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ5K>()));
         CK(cudaFuncSetAttribute(pf::mmh<pf::TQ6K>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ6K>()));
         CK(cudaFuncSetAttribute(pf::mmh<pf::TQ80>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ80>()));
         CK(cudaFuncSetAttribute(pf::mmh<pf::TQ4K, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ4K>()));
+        CK(cudaFuncSetAttribute(pf::mmh<pf::TQ5K, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ5K>()));
+        CK(cudaFuncSetAttribute(pf::mmh<pf::TQ6K, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ6K>()));
+        CK(cudaFuncSetAttribute(pf::mmh<pf::TQ80, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ80>()));
         CK(cudaFuncSetAttribute(pk_attn<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, AT_SMEM));
         CK(cudaFuncSetAttribute(pk_attn<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, AT_SMEM));
         pf_ready = true;
+    }
+
+    // y[t] (+)= W x_t over D outputs for a K-sharded weight: at TP > 1 each card's GEMM writes its partial
+    // into part, then both cards sum p0 + p1 (rank order) into y.  part and the events alternate per
+    // reduction: the peer reuses a buffer two reductions later, only after it got my next partial,
+    // which my stream produces after this all-reduce read the peer's buffer.
+    void pf_out(const Mat & m, int T, float * y, int mode, const __half * xin = nullptr) {
+#if MK_TP > 1
+        const int b = ar_n++ & 1;
+        gemm(m, T, hp.part[b], D, pf::OUT_STORE, 0, xin);
+        CK(cudaEventRecord(ev_done[b], 0));
+        hbar->wait(); // the peer's record is enqueued before this card waits on it
+        CK(cudaStreamWaitEvent(0, peer->ev_done[b], 0));
+        const int n = T * D;
+        pk_allreduce<<<std::min((n + 255) / 256, 8 * nsm), 256>>>(y, hp.part[b], peer->hp.part[b], n, rank, mode == pf::OUT_ADD);
+#else
+        gemm(m, T, y, D, mode, 0, xin);
+#endif
     }
 
     // y[t][row] (+)= W x_t for the first ntok fp16 rows of xh (token offset t0)
@@ -2655,13 +3342,19 @@ struct MKEngine::Impl {
         }
     }
 
-    // xh2[t] = silu(Wg x_t) * (Wu x_t) for the first ntok rows of xh (both Q4_K)
+    // xh2[t] = silu(Wg x_t) * (Wu x_t) for the first ntok rows of xh (gate / up same type)
     void gemm_glu(const Mat & g, const Mat & u, int ntok) {
-        if (g.type != T_Q4K || u.type != T_Q4K || u.rb != g.rb) throw std::runtime_error("gemm_glu: expected Q4_K gate / up");
+        if (g.type != u.type || u.rb != g.rb) throw std::runtime_error("gemm_glu: gate / up type or row stride mismatch");
         const pf::WMat W{g.w, g.d, g.type, g.K, g.N, g.rb, g.nd};
         const pf::Out O{nullptr, g.N, pf::OUT_STORE, hp.xh2};
         const dim3 grid(g.N / (pf::BM / 2), (ntok + pf::BN - 1) / pf::BN);
-        pf::mmh<pf::TQ4K, true><<<grid, 256, pf::hm_smem<pf::TQ4K>()>>>(W, hp.xh, ntok, O, u.w);
+        switch (g.type) {
+            case T_Q4K: pf::mmh<pf::TQ4K, true><<<grid, 256, pf::hm_smem<pf::TQ4K>()>>>(W, hp.xh, ntok, O, u.w, nullptr); break;
+            case T_Q5K: pf::mmh<pf::TQ5K, true><<<grid, 256, pf::hm_smem<pf::TQ5K>()>>>(W, hp.xh, ntok, O, u.w, nullptr); break;
+            case T_Q6K: pf::mmh<pf::TQ6K, true><<<grid, 256, pf::hm_smem<pf::TQ6K>()>>>(W, hp.xh, ntok, O, u.w, nullptr); break;
+            case T_Q8_0: pf::mmh<pf::TQ80, true><<<grid, 256, pf::hm_smem<pf::TQ80>()>>>(W, hp.xh, ntok, O, u.w, u.d); break;
+            default: throw std::runtime_error("gemm_glu: unsupported weight type");
+        }
     }
 
     // MK_PF_PROFILE=1: per-category GPU time of the batched prefill (events around each launch)
@@ -2743,6 +3436,36 @@ struct MKEngine::Impl {
     // positions >= first -> sink.
     void pf_run(const std::vector<int> & toks, int n0, std::vector<int> * pred, const MKEngine::LogitSink * sink = nullptr,
                 int first = 0) {
+#if MK_TP > 1
+        ar_n = peer->ar_n = 0;
+        std::exception_ptr err;
+        std::thread t([&] {
+            try {
+                peer->pf_rank(toks, n0, nullptr, nullptr, first, pred != nullptr, sink != nullptr);
+            } catch (...) {
+                err = std::current_exception();
+                hbar->abort();
+            }
+        });
+        try {
+            pf_rank(toks, n0, pred, sink, first, pred != nullptr, sink != nullptr);
+        } catch (...) {
+            hbar->abort();
+            t.join();
+            throw;
+        }
+        t.join();
+        if (err) std::rethrow_exception(err);
+        use();
+#else
+        pf_rank(toks, n0, pred, sink, first, pred != nullptr, sink != nullptr);
+#endif
+    }
+
+    // One card's prefill (its own thread at TP > 1; only rank 0 gets pred / sink, want_* tell rank 1).
+    void pf_rank(const std::vector<int> & toks, int n0, std::vector<int> * pred, const MKEngine::LogitSink * sink, int first,
+                 bool want_pred, bool want_sink) {
+        use();
         pf_init();
         const int N = (int) toks.size(), cap = hp.cap;
         if (n0 == 0) CK(cudaMemset(hp.h, 0, D * sizeof(float)));
@@ -2756,69 +3479,98 @@ struct MKEngine::Impl {
                 const LayerW & W = hw.L[L];
                 pf_time("norm_quant", [&] { pk_norm_quant<<<T, 256>>>(hp.x, W.attn_norm); });
                 if (W.attn) {
-                    pf_time("gemm_attn_qkv", [&] { gemm(W.q, T, hp.y0, QG, pf::OUT_STORE); });
-                    pf_time("gemm_attn_qkv", [&] { gemm(W.k, T, hp.y1, 2 * KVD, pf::OUT_STORE); gemm(W.v, T, hp.y1 + KVD, 2 * KVD, pf::OUT_STORE); });
+                    pf_time("gemm_attn_qkv", [&] { gemm(W.q, T, hp.y0, QG_L, pf::OUT_STORE); });
+                    pf_time("gemm_attn_qkv", [&] { gemm(W.k, T, hp.y1, 2 * KVD_L, pf::OUT_STORE); gemm(W.v, T, hp.y1 + KVD_L, 2 * KVD_L, pf::OUT_STORE); });
                     pf_time("attn_prep", [&] { pk_attn_prep<<<T, 256>>>(n, L / 4, W.qn, W.kn, 1); });
                     pf_time("attn", [&] {
-                        if (hb.kvq8) pk_attn<true><<<dim3((T + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(T, n, L / 4);
-                        else pk_attn<false><<<dim3((T + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(T, n, L / 4);
+                        if (hb.kvq8) pk_attn<true><<<dim3((T + AT_Q - 1) / AT_Q, NKV_L), 192, AT_SMEM>>>(T, n, L / 4);
+                        else pk_attn<false><<<dim3((T + AT_Q - 1) / AT_Q, NKV_L), 192, AT_SMEM>>>(T, n, L / 4);
                     });
                     pf_time("attn_out", [&] { pk_attn_out<<<T, 256>>>(); });
-                    pf_time("gemm_attn_o", [&] { gemm(W.o, T, hp.x, D, pf::OUT_ADD); });
+                    pf_time("gemm_attn_o", [&] { pf_out(W.o, T, hp.x, pf::OUT_ADD); });
                 } else {
-                    pf_time("gemm_dn_in", [&] { gemm(W.qkv, T, hp.y0, QKV, pf::OUT_STORE); gemm(W.gate, T, hp.y1, VD, pf::OUT_STORE); });
+                    pf_time("gemm_dn_in", [&] { gemm(W.qkv, T, hp.y0, QKV_L, pf::OUT_STORE); gemm(W.gate, T, hp.y1, VD_L, pf::OUT_STORE); });
                     pf_time("dn_ab", [&] { pk_ab<<<dim3((T + 63) / 64, AB_SPLITS), 256>>>(W.ab, T); });
                     pf_time("dn_prep", [&] { pk_dn_prep<<<T, 256>>>(T, n, dl, W.conv, W.dt, W.A); pk_conv_ring<<<std::min(T, CONV_RING), 256>>>(T, n, dl); });
-                    pf_time("dn_scan", [&] { pk_dn_scan<<<dim3(NVH, 2), 256>>>(T, dl); });
+                    pf_time("dn_scan", [&] { pk_dn_scan<<<dim3(NVH_L, 2), 256>>>(T, dl); });
                     pf_time("dn_out", [&] { pk_dn_out<<<T, 256>>>(W.snorm); });
-                    pf_time("gemm_dn_out", [&] { gemm(W.sout, T, hp.x, D, pf::OUT_ADD); });
+                    pf_time("gemm_dn_out", [&] { pf_out(W.sout, T, hp.x, pf::OUT_ADD); });
                     dl++;
                 }
                 pf_time("norm_quant", [&] { pk_norm_quant<<<T, 256>>>(hp.x, W.post_norm); });
                 pf_time("gemm_ffn_gu", [&] { gemm_glu(W.fg, W.fu, T); });
-                pf_time("gemm_ffn_down", [&] { gemm(W.fd, T, hp.x, D, pf::OUT_ADD, 0, hp.xh2); });
+                pf_time("gemm_ffn_down", [&] { pf_out(W.fd, T, hp.x, pf::OUT_ADD, hp.xh2); });
             }
-            if (pred || sink) {
+            if (want_pred || want_sink) {
+                // each card scores its vocab half; rank 0 joins the halves (logits) and merges the argmax
                 pk_norm_quant<<<T, 256>>>(hp.x, hw.onorm);
                 std::vector<float> rows;
                 for (int s = 0; s < T; s += 128) {
                     const int nt = std::min(128, T - s);
                     const int lo = std::max(s, first - n); // rows from lo on are at positions >= first
-                    if (!pred && lo >= s + nt) continue;
-                    gemm(hw.head, nt, hp.y0, VOCAB, pf::OUT_STORE, s);
-                    if (pred) pk_argmax<<<nt, 256>>>(s);
-                    if (sink && lo < s + nt) {
-                        rows.resize((size_t) (s + nt - lo) * VOCAB);
-                        CK(cudaMemcpy(rows.data(), hp.y0 + (size_t) (lo - s) * VOCAB, rows.size() * sizeof(float), cudaMemcpyDeviceToHost));
-                        (*sink)(n + lo, s + nt - lo, rows.data());
+                    if (!want_pred && lo >= s + nt) continue;
+                    gemm(hw.head, nt, hp.y0, VOCAB_L, pf::OUT_STORE, s);
+                    if (want_pred) pk_argmax<<<nt, 256>>>(s);
+                    if (want_sink && lo < s + nt) {
+                        if (MK_TP > 1) {
+                            CK(cudaDeviceSynchronize());
+                            hbar->wait(); // both halves written
+                        }
+                        if (rank == 0) {
+                            rows.resize((size_t) (s + nt - lo) * VOCAB);
+                            for (int r = 0; r < MK_TP; r++) {
+                                const Impl * e = r ? peer : this;
+                                CK(cudaMemcpy2D(rows.data() + (size_t) r * VOCAB_L, (size_t) VOCAB * 4, e->hp.y0 + (size_t) (lo - s) * VOCAB_L,
+                                                (size_t) VOCAB_L * 4, (size_t) VOCAB_L * 4, s + nt - lo, cudaMemcpyDeviceToHost));
+                            }
+                            (*sink)(n + lo, s + nt - lo, rows.data());
+                        }
+                        if (MK_TP > 1) hbar->wait(); // rank 1 overwrites y0 only after rank 0 copied it
                     }
                 }
-                if (pred) {
-                    std::vector<int> am(T);
-                    CK(cudaMemcpy(am.data(), hp.amax, T * sizeof(int), cudaMemcpyDeviceToHost));
-                    pred->insert(pred->end(), am.begin(), am.end());
+                if (want_pred) {
+                    if (MK_TP > 1) {
+                        CK(cudaDeviceSynchronize());
+                        hbar->wait();
+                    }
+                    if (rank == 0) {
+                        std::vector<int> am(T), ai(T);
+                        std::vector<float> av(T), bv(T);
+                        CK(cudaMemcpy(am.data(), hp.amax, T * sizeof(int), cudaMemcpyDeviceToHost));
+                        CK(cudaMemcpy(av.data(), hp.amaxv, T * sizeof(float), cudaMemcpyDeviceToHost));
+                        for (int r = 1; r < MK_TP; r++) { // higher logit wins, a tie keeps the smaller (rank 0) id
+                            CK(cudaMemcpy(ai.data(), peer->hp.amax, T * sizeof(int), cudaMemcpyDeviceToHost));
+                            CK(cudaMemcpy(bv.data(), peer->hp.amaxv, T * sizeof(float), cudaMemcpyDeviceToHost));
+                            for (int t = 0; t < T; t++)
+                                if (bv[t] > av[t]) { av[t] = bv[t]; am[t] = ai[t] + r * VOCAB_L; }
+                        }
+                        pred->insert(pred->end(), am.begin(), am.end());
+                    }
+                    if (MK_TP > 1) hbar->wait(); // rank 1 overwrites amax only after rank 0 read it
                 }
                 continue;
             }
             pf_time("mtp", [&] {
                 pk_final_h<<<T, 256>>>(T, n);
                 pk_mtp_in<<<T, 256>>>();
-                gemm(hw.eh, T, hp.xm, D, pf::OUT_STORE);
+                pf_out(hw.eh, T, hp.xm, pf::OUT_STORE);
                 const LayerW & M = hw.L[NL];
                 pk_norm_quant<<<T, 256>>>(hp.xm, M.attn_norm);
-                gemm(M.k, T, hp.y1, 2 * KVD, pf::OUT_STORE);
-                gemm(M.v, T, hp.y1 + KVD, 2 * KVD, pf::OUT_STORE);
+                gemm(M.k, T, hp.y1, 2 * KVD_L, pf::OUT_STORE);
+                gemm(M.v, T, hp.y1 + KVD_L, 2 * KVD_L, pf::OUT_STORE);
                 pk_attn_prep<<<T, 256>>>(n, 16, M.qn, M.kn, 0);
             });
             CK(cudaMemcpyAsync(hp.h, hp.h + (size_t) T * D, D * sizeof(float), cudaMemcpyDeviceToDevice));
         }
         CK(cudaGetLastError());
         CK(cudaDeviceSynchronize());
-        pf_report();
+        if (rank == 0) pf_report();
     }
 
     void reset() {
-        CK(cudaMemset(hb.dstate, 0, sizeof(float) * (size_t) 48 * NVH * 128 * 128));
+        if (sub) sub->reset();
+        use();
+        CK(cudaMemset(hb.dstate, 0, sizeof(float) * (size_t) 48 * NVH_L * 128 * 128));
         CK(cudaMemset(hb.h_hist, 0, sizeof(float) * (size_t) H_RING * D));
         memset(&hctl, 0, sizeof(hctl));
         CK(cudaMemcpy(hb.ctl, &hctl, sizeof(Ctl), cudaMemcpyHostToDevice));
@@ -2850,7 +3602,7 @@ int MKEngine::position() const { return p_->hctl.n; }
 int MKEngine::prefill(const std::vector<int> & tokens) {
     if (tokens.empty()) throw std::runtime_error("empty prompt");
     Ctl & c = p_->hctl;
-    CK(cudaMemcpy(&c, p_->hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
+    p_->get_ctl(c);
     std::vector<int> & seq = p_->seq;
     if ((int) (seq.size() + tokens.size()) + 8 > p_->ctx) throw std::runtime_error("prompt exceeds context");
     seq.insert(seq.end(), tokens.begin(), tokens.end());
@@ -2878,10 +3630,10 @@ int MKEngine::prefill(const std::vector<int> & tokens) {
         const bool last = i + T == feed.size();
         c.n = c.dn_c;
         for (int k = 0; k < T; k++) c.tok[k] = feed[i + k];
-        CK(cudaMemcpy(p_->hb.ctl, &c, sizeof(Ctl), cudaMemcpyHostToDevice));
+        p_->put_ctl(c);
         p_->ndraft = p_->n_draft_max;
         p_->launch(MODE_PREFILL, T, last ? 1 : 0);
-        CK(cudaMemcpy(&c, p_->hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
+        p_->get_ctl(c);
         i += T;
     }
     p_->nd_avail = p_->ndraft;
@@ -2928,15 +3680,15 @@ std::vector<int> MKEngine::score(const std::vector<int> & tokens) {
         return pred;
     }
     Ctl & c = p_->hctl;
-    CK(cudaMemcpy(&c, p_->hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
+    p_->get_ctl(c);
     size_t i = 0;
     while (i < tokens.size()) {
         const int T = (int) std::min<size_t>(MAXT, tokens.size() - i);
         c.n = (int) i;
         for (int k = 0; k < T; k++) c.tok[k] = tokens[i + k];
-        CK(cudaMemcpy(p_->hb.ctl, &c, sizeof(Ctl), cudaMemcpyHostToDevice));
+        p_->put_ctl(c);
         p_->launch(MODE_PREFILL, T, 0, 1);
-        CK(cudaMemcpy(&c, p_->hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
+        p_->get_ctl(c);
         for (int k = 0; k < T; k++) pred.push_back(c.tgt[k]);
         i += T;
     }
@@ -2953,19 +3705,19 @@ void MKEngine::score_logits(const std::vector<int> & tokens, int mk_from, int fi
     if (mk_from > 0)
         p_->pf_run(std::vector<int>(tokens.begin(), tokens.begin() + mk_from), 0, nullptr, first < mk_from ? &sink : nullptr, first);
     Ctl & c = p_->hctl;
-    CK(cudaMemcpy(&c, p_->hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
+    p_->get_ctl(c);
     c.dn_c = mk_from;
     std::vector<float> rows((size_t) MAXT * VOCAB);
     for (int i = mk_from; i < N;) {
         const int T = std::min(MAXT, N - i);
         c.n = i;
         for (int k = 0; k < T; k++) c.tok[k] = tokens[i + k];
-        CK(cudaMemcpy(p_->hb.ctl, &c, sizeof(Ctl), cudaMemcpyHostToDevice));
+        p_->put_ctl(c);
         p_->launch(MODE_PREFILL, T, 0, 2);
-        CK(cudaMemcpy(&c, p_->hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
+        p_->get_ctl(c);
         const int s = std::max(0, first - i);
         if (s < T) {
-            CK(cudaMemcpy(rows.data(), p_->hb.logits + (size_t) s * VOCAB, (size_t) (T - s) * VOCAB * sizeof(float), cudaMemcpyDeviceToHost));
+            p_->get_logits(rows.data(), s, T - s);
             sink(i + s, T - s, rows.data());
         }
         i += T;
@@ -2982,7 +3734,7 @@ int MKEngine::step(std::vector<int> & out) {
     p_->ndraft = (!p_->all_acc && n_draft_ > 3) ? n_draft_ - 1 : n_draft_;
     p_->launch(MODE_DECODE, T, 0);
     p_->nd_avail = p_->ndraft;
-    CK(cudaMemcpy(&c, p_->hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
+    p_->get_ctl(c);
     for (int i = 0; i < c.n_out; i++) out.push_back(c.out[i]);
     p_->seq.insert(p_->seq.end(), c.out, c.out + c.n_out);
     p_->dv_add(c.out, c.n_out);
@@ -2996,6 +3748,7 @@ int MKEngine::step(std::vector<int> & out) {
 std::vector<float> MKEngine::last_hidden() {
     std::vector<float> h(D);
     const int pos = p_->hctl.dn_c - 1;
+    p_->use();
     CK(cudaMemcpy(h.data(), p_->hb.h_hist + (size_t) (pos % H_RING) * D, D * 4, cudaMemcpyDeviceToHost));
     return h;
 }

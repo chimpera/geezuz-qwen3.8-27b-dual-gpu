@@ -17,12 +17,14 @@ struct PBufs {
     float * y1;   // [cap][FF]  z | k,v | ffn up
     float * y2;   // [cap][VD]  delta-net / attention output
     __half * dq;  // [cap][QKV] conv'd + normalised q | k | v (fp16)
-    float * gb;   // [cap][2 * NVH] log g | beta
-    float * ab;   // [AB_SPLITS][cap][2 * NVH] alpha | beta pre-activations (split-K partials)
+    float * gb;   // [cap][2 * NVH_L] log g | beta
+    float * ab;   // [AB_SPLITS][cap][2 * NVH_L] alpha | beta pre-activations (split-K partials)
     float * h;    // [cap + 1][D] final normed hidden of positions n0 - 1 .. n0 + T - 1
     __half * qh;  // [cap][NH][HD] attention queries (normed, rotated, pre-scaled)
     int * tok;    // [cap]
     int * amax;   // [cap] argmax output (scoring)
+    float * amaxv; // [cap] its logit (the host merges the cards' vocab halves)
+    float * part[2]; // TP > 1: [cap][D] this card's partial GEMM output, double-buffered per reduction
 };
 
 __constant__ PBufs cP;
@@ -49,6 +51,44 @@ __device__ __forceinline__ float dequant_q4k_ldg(const uint8_t * row, int e) {
     return d * (float) s * (float) qv - dmin * (float) m;
 }
 
+// one element of a raw GGUF row for the four embedding types; same math as dequant_elem, all
+// global loads through the read-only path (__ldg)
+__device__ __forceinline__ float dequant_elem_ldg(const uint8_t * row, int type, int e) {
+    if (type == 8) { // Q8_0: 34 B per 32
+        const uint8_t * blk = row + (e >> 5) * 34;
+        const float d = __half2float(__ldg(reinterpret_cast<const __half *>(blk)));
+        return d * (float) (int8_t) __ldg(blk + 2 + (e & 31));
+    }
+    if (type == 12) return dequant_q4k_ldg(row, e);
+    if (type == 13) { // Q5_K: 176 B per 256, 5th bit stored in qh
+        const int b = e >> 8, w = e & 255, g = w >> 6, l = w & 63, lo = l < 32;
+        const uint8_t * blk = row + b * 176;
+        const float d = __half2float(__ldg(reinterpret_cast<const __half *>(blk)));
+        const float dmin = __half2float(__ldg(reinterpret_cast<const __half *>(blk + 2)));
+        const uint8_t * sc = blk + 4;
+        const int sb = 2 * g + !lo;
+        int s, m;
+        if (sb < 4) {
+            s = __ldg(sc + sb) & 63;
+            m = __ldg(sc + sb + 4) & 63;
+        } else {
+            s = (__ldg(sc + sb + 4) & 0xF) | ((__ldg(sc + sb - 4) >> 6) << 4);
+            m = (__ldg(sc + sb + 4) >> 4) | ((__ldg(sc + sb) >> 6) << 4);
+        }
+        const int qb = __ldg(blk + 48 + 32 * g + (l & 31));
+        const int q = (lo ? qb & 0xF : qb >> 4) + ((__ldg(blk + 16 + (l & 31)) >> (2 * g + !lo) & 1) ? 16 : 0);
+        return d * (float) s * (float) q - dmin * (float) m;
+    }
+    // Q6_K: 210 B per 256, ql/qh low+high bits, int8 scales
+    const int b = e >> 8, n = e & 255, l = n & 31, t = n >> 5, h = n >> 7;
+    const uint8_t * blk = row + b * 210;
+    const float d = __half2float(__ldg(reinterpret_cast<const __half *>(blk + 208)));
+    const int8_t * sc = reinterpret_cast<const int8_t *>(blk + 192) + h * 8 + (l >> 4) + 2 * t;
+    const int qb = __ldg(blk + h * 64 + (t & 1) * 32 + l);
+    const int q = ((t < 2 ? qb & 0xF : qb >> 4) | (((__ldg(blk + 128 + h * 32 + l) >> (2 * t)) & 3) << 4)) - 32;
+    return d * (float) __ldg(sc) * (float) q;
+}
+
 // lane i holds element i of a 32-block starting at dst: store it as fp16 in GEMM order (saturating)
 __device__ __forceinline__ void hstore32(float v, __half * dst) {
     dst[pf::hperm(threadIdx.x & 31)] = __float2half_rn(fminf(fmaxf(v, -65504.f), 65504.f));
@@ -66,8 +106,8 @@ __device__ __forceinline__ float block_sum256(float v, float * red) {
 
 __global__ void pk_embed(int T) {
     const int t = blockIdx.x;
-    const uint8_t * row = cW.embd + (size_t) cP.tok[t] * (D / 256 * 144);
-    for (int e = threadIdx.x; e < D; e += blockDim.x) cP.x[(size_t) t * D + e] = dequant_q4k_ldg(row, e);
+    const uint8_t * row = cW.embd + (size_t) cP.tok[t] * cW.embd_rb;
+    for (int e = threadIdx.x; e < D; e += blockDim.x) cP.x[(size_t) t * D + e] = dequant_elem_ldg(row, cW.embd_type, e);
 }
 
 // RMS-norm (weight w) of rows of src [T][D] -> fp16 xh (K = D); rs per token
@@ -89,18 +129,19 @@ __global__ void __launch_bounds__(256) pk_norm_quant(const float * src, const fl
 }
 
 // delta-net alpha / beta: ab[c][t][r] = rs[t] * sum_{k in split c} Wab[r][k] x[t][k] (attn_norm folded
-// into Wab).  Block = 64 tokens x 96 rows x one of AB_SPLITS K-splits; thread = 4 tokens x 6 rows.
+// into Wab).  Block = 64 tokens x AB_N rows x one of AB_SPLITS K-splits; thread = 4 tokens x AB_R rows.
 constexpr int AB_SPLITS = 8, AB_KS = D / AB_SPLITS;
+constexpr int AB_N = 2 * NVH_L, AB_R = AB_N / 16; // 96 rows, 6 per thread (3 at TP=2)
 __global__ void __launch_bounds__(256) pk_ab(const float * Wab, int T) {
     __shared__ float sx[32][64 + 4];
-    __shared__ float sw[32][96 + 4];
-    const int tid = threadIdx.x, tg = tid & 15, rg = tid >> 4; // tokens 4 tg .. , rows 6 rg ..
+    __shared__ float sw[32][AB_N + 4];
+    const int tid = threadIdx.x, tg = tid & 15, rg = tid >> 4; // tokens 4 tg .. , rows AB_R rg ..
     const int t0 = blockIdx.x * 64, k00 = blockIdx.y * AB_KS;
-    float acc[4][6];
+    float acc[4][AB_R];
 #pragma unroll
     for (int i = 0; i < 4; i++)
 #pragma unroll
-        for (int j = 0; j < 6; j++) acc[i][j] = 0.f;
+        for (int j = 0; j < AB_R; j++) acc[i][j] = 0.f;
     for (int k0 = k00; k0 < k00 + AB_KS; k0 += 32) {
         for (int i = tid; i < 64 * 8; i += 256) { // x tile, transposed to [k][token]
             const int tt = i >> 3, kk = (i & 7) * 4;
@@ -108,7 +149,7 @@ __global__ void __launch_bounds__(256) pk_ab(const float * Wab, int T) {
                                          : make_float4(0.f, 0.f, 0.f, 0.f);
             sx[kk][tt] = v.x; sx[kk + 1][tt] = v.y; sx[kk + 2][tt] = v.z; sx[kk + 3][tt] = v.w;
         }
-        for (int i = tid; i < 96 * 8; i += 256) {
+        for (int i = tid; i < AB_N * 8; i += 256) {
             const int rr = i >> 3, kk = (i & 7) * 4;
             const float4 v = __ldg(reinterpret_cast<const float4 *>(Wab + (size_t) rr * D + k0 + kk));
             sw[kk][rr] = v.x; sw[kk + 1][rr] = v.y; sw[kk + 2][rr] = v.z; sw[kk + 3][rr] = v.w;
@@ -117,14 +158,14 @@ __global__ void __launch_bounds__(256) pk_ab(const float * Wab, int T) {
 #pragma unroll 4
         for (int kk = 0; kk < 32; kk++) {
             const float4 xv = *reinterpret_cast<const float4 *>(&sx[kk][4 * tg]);
-            float wv[6];
+            float wv[AB_R];
 #pragma unroll
-            for (int j = 0; j < 6; j++) wv[j] = sw[kk][6 * rg + j];
+            for (int j = 0; j < AB_R; j++) wv[j] = sw[kk][AB_R * rg + j];
             const float xa[4] = {xv.x, xv.y, xv.z, xv.w};
 #pragma unroll
             for (int i = 0; i < 4; i++)
 #pragma unroll
-                for (int j = 0; j < 6; j++) acc[i][j] = fmaf(xa[i], wv[j], acc[i][j]);
+                for (int j = 0; j < AB_R; j++) acc[i][j] = fmaf(xa[i], wv[j], acc[i][j]);
         }
         __syncthreads();
     }
@@ -134,7 +175,7 @@ __global__ void __launch_bounds__(256) pk_ab(const float * Wab, int T) {
         if (t >= T) continue;
         const float rs = __ldg(cP.rs + t);
 #pragma unroll
-        for (int j = 0; j < 6; j++) cP.ab[((size_t) blockIdx.y * cP.cap + t) * 96 + 6 * rg + j] = acc[i][j] * rs;
+        for (int j = 0; j < AB_R; j++) cP.ab[((size_t) blockIdx.y * cP.cap + t) * AB_N + AB_R * rg + j] = acc[i][j] * rs;
     }
 }
 
@@ -142,19 +183,19 @@ __global__ void __launch_bounds__(256) pk_ab(const float * Wab, int T) {
 __global__ void __launch_bounds__(256) pk_dn_prep(int T, int n0, int dl, const float * convw, const float * dt,
                                                   const float * A) {
     const int t = blockIdx.x, pos = n0 + t, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const float * ring = cB.conv + (size_t) dl * CONV_RING * QKV;
+    const float * ring = cB.conv + (size_t) dl * CONV_RING * QKV_L;
     auto raw = [&](int j, int c) -> float { // input of position pos - 3 + j
         const int tt = t - 3 + j, p = pos - 3 + j;
-        if (tt >= 0) return __ldg(cP.y0 + (size_t) tt * QKV + c);
-        if (p >= 0) return __ldg(ring + (size_t) (p % CONV_RING) * QKV + c);
+        if (tt >= 0) return __ldg(cP.y0 + (size_t) tt * QKV_L + c);
+        if (p >= 0) return __ldg(ring + (size_t) (p % CONV_RING) * QKV_L + c);
         return 0.f;
     };
     auto conv = [&](int c) {
         const float4 w = __ldg(reinterpret_cast<const float4 *>(convw + c * 4));
         return silu(w.x * raw(0, c) + w.y * raw(1, c) + w.z * raw(2, c) + w.w * raw(3, c));
     };
-    __half * out = cP.dq + (size_t) t * QKV;
-    for (int hh = warp; hh < 2 * NKH; hh += 8) { // q heads then k heads
+    __half * out = cP.dq + (size_t) t * QKV_L;
+    for (int hh = warp; hh < 2 * NKH_L; hh += 8) { // q heads then k heads
         float v[4];
         float ss = 0.f;
 #pragma unroll
@@ -163,32 +204,32 @@ __global__ void __launch_bounds__(256) pk_dn_prep(int T, int n0, int dl, const f
             ss += v[i] * v[i];
         }
         float sc = rsqrtf(fmaxf(wsum(ss), EPS * EPS));
-        if (hh < NKH) sc *= 0.08838834764831845f; // 1/sqrt(128)
+        if (hh < NKH_L) sc *= 0.08838834764831845f; // 1/sqrt(128)
 #pragma unroll
         for (int i = 0; i < 4; i++) out[hh * 128 + lane + 32 * i] = __float2half_rn(v[i] * sc);
     }
-    for (int c = 2 * NKH * 128 + threadIdx.x; c < QKV; c += 256) out[c] = __float2half_rn(conv(c));
-    if (threadIdx.x < NVH) {
+    for (int c = 2 * NKH_L * 128 + threadIdx.x; c < QKV_L; c += 256) out[c] = __float2half_rn(conv(c));
+    if (threadIdx.x < NVH_L) {
         const int h = threadIdx.x;
         float al = 0.f, be = 0.f;
 #pragma unroll
         for (int c = 0; c < AB_SPLITS; c++) {
-            al += __ldg(cP.ab + ((size_t) c * cP.cap + t) * 96 + h);
-            be += __ldg(cP.ab + ((size_t) c * cP.cap + t) * 96 + NVH + h);
+            al += __ldg(cP.ab + ((size_t) c * cP.cap + t) * AB_N + h);
+            be += __ldg(cP.ab + ((size_t) c * cP.cap + t) * AB_N + NVH_L + h);
         }
         float sp = al + __ldg(dt + h);
         sp = sp > 20.0f ? sp : logf(1.0f + expf(sp));
-        cP.gb[(size_t) t * 96 + h] = sp * __ldg(A + h); // log g: finite even when g underflows
-        cP.gb[(size_t) t * 96 + NVH + h] = 1.0f / (1.0f + expf(-be));
+        cP.gb[(size_t) t * AB_N + h] = sp * __ldg(A + h); // log g: finite even when g underflows
+        cP.gb[(size_t) t * AB_N + NVH_L + h] = 1.0f / (1.0f + expf(-be));
     }
 }
 
 // raw qkv rows of the chunk's last positions -> conv ring (after pk_dn_prep consumed the old ones)
 __global__ void pk_conv_ring(int T, int n0, int dl) {
-    float * ring = cB.conv + (size_t) dl * CONV_RING * QKV;
+    float * ring = cB.conv + (size_t) dl * CONV_RING * QKV_L;
     const int nt = min(T, CONV_RING), t = T - nt + blockIdx.x;
-    for (int c = threadIdx.x; c < QKV; c += blockDim.x)
-        ring[(size_t) ((n0 + t) % CONV_RING) * QKV + c] = __ldg(cP.y0 + (size_t) t * QKV + c);
+    for (int c = threadIdx.x; c < QKV_L; c += blockDim.x)
+        ring[(size_t) ((n0 + t) % CONV_RING) * QKV_L + c] = __ldg(cP.y0 + (size_t) t * QKV_L + c);
 }
 
 // Gated delta rule over the chunk in the chunked (WY) form on tensor cores.  Per 32-token chunk,
@@ -237,9 +278,9 @@ __global__ void __launch_bounds__(256, 2) pk_dn_scan(int T, int dl) {
     __shared__ __align__(16) __half sT0[DC][DC_LP], sT1[DC][DC_LP], sP[DC][DC_LP];
     __shared__ __align__(16) float sAT[DC][DC_LA]; // A transposed: sAT[j][i] = A_ij
     __shared__ float sa[DC], sb[DC], sg[DC], sd[DC];
-    const int h = blockIdx.x, kh = h % NKH, tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, t4 = lane & 3;
+    const int h = blockIdx.x, kh = h % NKH_L, tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, t4 = lane & 3;
     const int col0 = blockIdx.y * 64 + 8 * w; // this warp's 8 value columns
-    float * Sg = cB.dstate + ((size_t) dl * NVH + h) * 128 * 128; // [col][row]
+    float * Sg = cB.dstate + ((size_t) dl * NVH_L + h) * 128 * 128; // [col][row]
     float S[8][4];                                                // rows 16 mt + g (+8), columns col0 + 2 t4 (+1)
 #pragma unroll
     for (int mt = 0; mt < 8; mt++) {
@@ -256,16 +297,16 @@ __global__ void __launch_bounds__(256, 2) pk_dn_scan(int T, int dl) {
 #pragma unroll
         for (int k = 0; k < 4; k++) {
             const int i = tid + 256 * k, tt = i >> 5, c = i & 31, t = tb + tt;
-            pqk[k] = t < T ? __ldg(reinterpret_cast<const uint4 *>(cP.dq + (size_t) t * QKV + (c < 16 ? 0 : NKH * 128) + kh * 128) + (c & 15))
+            pqk[k] = t < T ? __ldg(reinterpret_cast<const uint4 *>(cP.dq + (size_t) t * QKV_L + (c < 16 ? 0 : NKH_L * 128) + kh * 128) + (c & 15))
                            : make_uint4(0, 0, 0, 0);
         }
         const int t = tb + (tid >> 3);
-        pv = t < T ? __ldg(reinterpret_cast<const uint4 *>(cP.dq + (size_t) t * QKV + 2 * NKH * 128 + h * 128 + blockIdx.y * 64) + (tid & 7))
+        pv = t < T ? __ldg(reinterpret_cast<const uint4 *>(cP.dq + (size_t) t * QKV_L + 2 * NKH_L * 128 + h * 128 + blockIdx.y * 64) + (tid & 7))
                    : make_uint4(0, 0, 0, 0);
         if (w == 0) {
             const int tl = tb + lane;
-            pbeta = tl < T ? __ldg(cP.gb + (size_t) tl * 96 + NVH + h) : 0.f;
-            plg = tl < T ? __ldg(cP.gb + (size_t) tl * 96 + h) : 0.f;
+            pbeta = tl < T ? __ldg(cP.gb + (size_t) tl * AB_N + NVH_L + h) : 0.f;
+            plg = tl < T ? __ldg(cP.gb + (size_t) tl * AB_N + h) : 0.f;
         }
     };
     auto put = [&] {
@@ -406,7 +447,7 @@ __global__ void __launch_bounds__(256, 2) pk_dn_scan(int T, int dl) {
             for (int hf = 0; hf < 2; hf++) {
                 const int t = tb + 16 * mt + g + 8 * hf;
                 if (t < T)
-                    *reinterpret_cast<float2 *>(cP.y2 + (size_t) t * VD + h * 128 + col0 + 2 * t4) =
+                    *reinterpret_cast<float2 *>(cP.y2 + (size_t) t * VD_L + h * 128 + col0 + 2 * t4) =
                         make_float2(o[mt][2 * hf], o[mt][2 * hf + 1]);
             }
 
@@ -438,12 +479,12 @@ __global__ void __launch_bounds__(256, 2) pk_dn_scan(int T, int dl) {
     }
 }
 
-// gated RMS norm of the delta-net output (z = y1) -> fp16 xh (K = VD)
+// gated RMS norm of the delta-net output (z = y1) -> fp16 xh (K = VD_L)
 __global__ void __launch_bounds__(256) pk_dn_out(const float * snorm) {
     const int t = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    for (int hh = warp; hh < NVH; hh += 8) {
-        const float * o = cP.y2 + (size_t) t * VD + hh * 128;
-        const float * z = cP.y1 + (size_t) t * VD + hh * 128;
+    for (int hh = warp; hh < NVH_L; hh += 8) {
+        const float * o = cP.y2 + (size_t) t * VD_L + hh * 128;
+        const float * z = cP.y1 + (size_t) t * VD_L + hh * 128;
         float v[4], ss = 0.f;
 #pragma unroll
         for (int i = 0; i < 4; i++) {
@@ -454,7 +495,7 @@ __global__ void __launch_bounds__(256) pk_dn_out(const float * snorm) {
 #pragma unroll
         for (int i = 0; i < 4; i++) {
             const int c = lane + 32 * i;
-            hstore32(v[i] * rs * __ldg(snorm + c) * silu(__ldg(z + c)), cP.xh + (size_t) t * VD + hh * 128 + 32 * i);
+            hstore32(v[i] * rs * __ldg(snorm + c) * silu(__ldg(z + c)), cP.xh + (size_t) t * VD_L + hh * 128 + 32 * i);
         }
     }
 }
@@ -463,14 +504,14 @@ __global__ void __launch_bounds__(256) pk_dn_out(const float * snorm) {
 __global__ void __launch_bounds__(256) pk_attn_prep(int n0, int slot, const float * qn, const float * kn, int do_q) {
     const int t = blockIdx.x, pos = n0 + t, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const size_t ctx = cB.ctx;
-    for (int it = warp; it < 32; it += 8) {
-        if (it < NH && !do_q) continue;
+    for (int it = warp; it < NH_L + 2 * NKV_L; it += 8) {
+        if (it < NH_L && !do_q) continue;
         float v[8];
-        if (it < NH) load8(cP.y0 + (size_t) t * QG + it * 512 + lane * 8, v);
-        else load8(cP.y1 + (size_t) t * 2 * KVD + (it >= NH + NKV ? KVD : 0) + ((it - NH) % NKV) * HD + lane * 8, v);
-        const bool isv = it >= NH + NKV;
+        if (it < NH_L) load8(cP.y0 + (size_t) t * QG_L + it * 512 + lane * 8, v);
+        else load8(cP.y1 + (size_t) t * 2 * KVD_L + (it >= NH_L + NKV_L ? KVD_L : 0) + ((it - NH_L) % NKV_L) * HD + lane * 8, v);
+        const bool isv = it >= NH_L + NKV_L;
         if (!isv) {
-            const float * nw = it < NH ? qn : kn;
+            const float * nw = it < NH_L ? qn : kn;
             float ss = 0.f;
 #pragma unroll
             for (int k = 0; k < 8; k++) ss += v[k] * v[k];
@@ -479,14 +520,14 @@ __global__ void __launch_bounds__(256) pk_attn_prep(int n0, int slot, const floa
             for (int k = 0; k < 8; k++) v[k] *= rs * __ldg(nw + lane * 8 + k);
             rope8(v, lane, pos);
         }
-        const float sc = it < NH ? 0.0625f : 1.0f;
+        const float sc = it < NH_L ? 0.0625f : 1.0f;
         __half2 hv[4];
 #pragma unroll
         for (int k = 0; k < 4; k++) hv[k] = __floats2half2_rn(v[2 * k] * sc, v[2 * k + 1] * sc);
-        if (it < NH) {
-            *reinterpret_cast<int4 *>(cP.qh + ((size_t) t * NH + it) * HD + lane * 8) = *reinterpret_cast<int4 *>(hv);
+        if (it < NH_L) {
+            *reinterpret_cast<int4 *>(cP.qh + ((size_t) t * NH_L + it) * HD + lane * 8) = *reinterpret_cast<int4 *>(hv);
         } else {
-            const size_t row = ((size_t) slot * NKV + (it - NH) % NKV) * ctx + pos;
+            const size_t row = ((size_t) slot * NKV_L + (it - NH_L) % NKV_L) * ctx + pos;
             if (cB.kvq8) kv_store_q8(static_cast<int8_t *>(isv ? cB.vc : cB.kc) + row * HD, (isv ? cB.vsc : cB.ksc) + row * (HD / 32), v);
             else *reinterpret_cast<int4 *>(static_cast<__half *>(isv ? cB.vc : cB.kc) + row * HD + lane * 8) = *reinterpret_cast<int4 *>(hv);
         }
@@ -507,14 +548,14 @@ __global__ void __launch_bounds__(192) pk_attn(int T, int n0, int slot) {
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g8 = lane >> 2, t4 = lane & 3;
     const int t0 = blockIdx.x * AT_Q, g = blockIdx.y;
     const size_t ctx = cB.ctx;
-    const size_t row0 = ((size_t) slot * NKV + g) * ctx;
+    const size_t row0 = ((size_t) slot * NKV_L + g) * ctx;
     const __half * Kc = static_cast<const __half *>(cB.kc) + row0 * HD;
     const __half * Vc = static_cast<const __half *>(cB.vc) + row0 * HD;
     const int nq = min(AT_Q, T - t0);
     for (int i = tid; i < 6 * AT_Q * 32; i += 192) { // 96 rows x 32 chunks of 16 B
         const int r = i >> 5, c = i & 31, hq = r / AT_Q, tt = r % AT_Q;
         __half * d = sQ + r * AT_LD + 8 * c;
-        if (tt < nq) cp_async16(d, cP.qh + ((size_t) (t0 + tt) * NH + g * 6 + hq) * HD + 8 * c);
+        if (tt < nq) cp_async16(d, cP.qh + ((size_t) (t0 + tt) * NH_L + g * 6 + hq) * HD + 8 * c);
         else *reinterpret_cast<int4 *>(d) = make_int4(0, 0, 0, 0);
     }
     pf::cpa_commit();
@@ -652,25 +693,25 @@ __global__ void __launch_bounds__(192) pk_attn(int T, int n0, int slot) {
     for (int i = 0; i < 32; i++) {
         const int d = 8 * i + 2 * t4;
         if (g8 < nq) {
-            float * dst = cP.y2 + (size_t) (t0 + g8) * VD + hq * HD + d;
+            float * dst = cP.y2 + (size_t) (t0 + g8) * VD_L + hq * HD + d;
             dst[0] = o[i][0] * il0;
             dst[1] = o[i][1] * il0;
         }
         if (g8 + 8 < nq) {
-            float * dst = cP.y2 + (size_t) (t0 + g8 + 8) * VD + hq * HD + d;
+            float * dst = cP.y2 + (size_t) (t0 + g8 + 8) * VD_L + hq * HD + d;
             dst[0] = o[i][2] * il1;
             dst[1] = o[i][3] * il1;
         }
     }
 }
 
-// attention output * sigmoid(gate) -> fp16 xh (K = VD)
+// attention output * sigmoid(gate) -> fp16 xh (K = VD_L)
 __global__ void __launch_bounds__(256) pk_attn_out() {
     const int t = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    for (int j = warp; j < VD / 32; j += 8) {
+    for (int j = warp; j < VD_L / 32; j += 8) {
         const int e = 32 * j + lane, h = e / HD, d = e % HD;
-        const float gate = __ldg(cP.y0 + (size_t) t * QG + h * 512 + 256 + d);
-        hstore32(__ldg(cP.y2 + (size_t) t * VD + e) / (1.0f + expf(-gate)), cP.xh + (size_t) t * VD + 32 * j);
+        const float gate = __ldg(cP.y0 + (size_t) t * QG_L + h * 512 + 256 + d);
+        hstore32(__ldg(cP.y2 + (size_t) t * VD_L + e) / (1.0f + expf(-gate)), cP.xh + (size_t) t * VD_L + 32 * j);
     }
 }
 
@@ -698,33 +739,40 @@ __global__ void __launch_bounds__(256) pk_mtp_in() {
     __shared__ float se[D];
     __shared__ float red[8];
     const int t = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const uint8_t * row = cW.embd + (size_t) cP.tok[t] * (D / 256 * 144);
+    const uint8_t * row = cW.embd + (size_t) cP.tok[t] * cW.embd_rb;
     const float * hp = cP.h + (size_t) t * D;
     float ae = 0.f, ah = 0.f;
     for (int e = threadIdx.x; e < D; e += 256) {
-        const float v = dequant_q4k_ldg(row, e), hv = __ldg(hp + e);
+        const float v = dequant_elem_ldg(row, cW.embd_type, e), hv = __ldg(hp + e);
         se[e] = v;
         ae += v * v;
         ah += hv * hv;
     }
     const float rse = rsqrtf(block_sum256(ae, red) / (float) D + EPS);
     const float rsh = rsqrtf(block_sum256(ah, red) / (float) D + EPS);
-    for (int j = warp; j < 2 * D / 32; j += 8) {
-        const int e = 32 * (j % (D / 32)) + lane;
+    // eh_proj K is split per card (TP=2: rank 0 the embed half, rank 1 the h half)
+    constexpr int KE = 2 * D / MK_TP;
+#if MK_TP > 1
+    const int j0 = cB.rank * (D / 32);
+#else
+    const int j0 = 0;
+#endif
+    for (int jl = warp; jl < KE / 32; jl += 8) {
+        const int j = j0 + jl, e = 32 * (j % (D / 32)) + lane;
         const float v = j < D / 32 ? se[e] * rse * __ldg(cW.enorm + e) : __ldg(hp + e) * rsh * __ldg(cW.hnorm + e);
-        hstore32(v, cP.xh + (size_t) t * 2 * D + 32 * j);
+        hstore32(v, cP.xh + (size_t) t * KE + 32 * jl);
     }
 }
 
-// argmax over logits rows y0[t][0..VOCAB) (scoring)
+// argmax over logits rows y0[t][0..VOCAB_L) (scoring); ids are local, the host merges the cards by amaxv
 __global__ void __launch_bounds__(256) pk_argmax(int t0) {
     __shared__ float bv[8];
     __shared__ int bi[8];
     const int t = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const float * l = cP.y0 + (size_t) t * VOCAB;
+    const float * l = cP.y0 + (size_t) t * VOCAB_L;
     float b = -INFINITY;
     int ix = 0;
-    for (int i = threadIdx.x; i < VOCAB; i += 256)
+    for (int i = threadIdx.x; i < VOCAB_L; i += 256)
         if (__ldg(l + i) > b) { b = __ldg(l + i); ix = i; }
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
@@ -738,5 +786,16 @@ __global__ void __launch_bounds__(256) pk_argmax(int t0) {
         for (int w = 1; w < 8; w++)
             if (bv[w] > b || (bv[w] == b && bi[w] < ix)) { b = bv[w]; ix = bi[w]; }
         cP.amax[t0 + t] = ix;
+        cP.amaxv[t0 + t] = b;
+    }
+}
+
+// x (+)= p0 + p1 over n floats: the two cards' partial GEMM outputs, summed in rank order on both
+// cards so the replicated residual stays bit-identical (part_peer is the peer's buffer over P2P)
+__global__ void pk_allreduce(float * x, const float * part_mine, const float * part_peer, int n, int rank, int add) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        const float a = part_mine[i], b = __ldcg(part_peer + i);
+        const float s = rank == 0 ? a + b : b + a;
+        x[i] = add ? x[i] + s : s;
     }
 }

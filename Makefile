@@ -5,7 +5,7 @@ ARCH ?= $(or $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>
 ARCH := sm_$(patsubst sm_%,%,$(ARCH))
 NVFLAGS = -O3 -std=c++17 -arch=$(ARCH) -lineinfo -Xptxas -dlcm=cg -Xptxas -v -Xcompiler -fPIC
 
-all: qwen38_mk libqwen38mk.so tools/vocab_freq tools/llama_ref
+all: qwen38_mk libqwen38mk.so qwen38_mk_tp2 libqwen38mk_tp2.so tools/vocab_freq tools/llama_ref
 
 # ptxas register / spill report for every phase function goes to ptxas.log
 qwen38_mk.o: qwen38_mk.cu qwen38_mk.h gguf.h prefill.cuh prefill_gemm.cuh
@@ -20,6 +20,18 @@ libqwen38mk.so: qwen38_mk.o capi.cpp qwen38_mk.h
 	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -shared -Xcompiler -fPIC -I$(LLAMA)/include -I$(LLAMA)/ggml/include capi.cpp qwen38_mk.o \
 		-L$(LLAMA)/build/bin -lllama -lggml-base -Xlinker -rpath -Xlinker $(abspath $(LLAMA)/build/bin) -o $@
 
+# TP=2 variant: same compile with MK_TP=2, its own ptxas report
+qwen38_mk_tp2.o: qwen38_mk.cu qwen38_mk.h gguf.h prefill.cuh prefill_gemm.cuh
+	$(NVCC) $(NVFLAGS) -DMK_TP=2 -I$(LLAMA)/ggml/include -c qwen38_mk.cu -o $@ 2> ptxas_tp2.log || (cat ptxas_tp2.log; false)
+
+qwen38_mk_tp2: qwen38_mk_tp2.o main.cu logit_stats.h
+	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -I$(LLAMA)/include -I$(LLAMA)/ggml/include main.cu qwen38_mk_tp2.o \
+		-L$(LLAMA)/build/bin -lllama -lggml-base -Xlinker -rpath -Xlinker $(abspath $(LLAMA)/build/bin) -o $@
+
+libqwen38mk_tp2.so: qwen38_mk_tp2.o capi.cpp qwen38_mk.h
+	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -shared -Xcompiler -fPIC -I$(LLAMA)/include -I$(LLAMA)/ggml/include capi.cpp qwen38_mk_tp2.o \
+		-L$(LLAMA)/build/bin -lllama -lggml-base -Xlinker -rpath -Xlinker $(abspath $(LLAMA)/build/bin) -o $@
+
 tools/vocab_freq: tools/vocab_freq.cpp
 	g++ -O2 -std=c++17 -I$(LLAMA)/include -I$(LLAMA)/ggml/include $< -L$(LLAMA)/build/bin -lllama \
 		-Wl,-rpath,$(abspath $(LLAMA)/build/bin) -o $@
@@ -30,4 +42,5 @@ tools/llama_ref: tools/llama_ref.cpp logit_stats.h
 		-Wl,-rpath,$(abspath $(LLAMA)/build/bin) -o $@
 
 clean:
-	rm -f qwen38_mk libqwen38mk.so qwen38_mk.o ptxas.log tools/vocab_freq tools/llama_ref
+	rm -f qwen38_mk libqwen38mk.so qwen38_mk.o ptxas.log qwen38_mk_tp2 libqwen38mk_tp2.so qwen38_mk_tp2.o ptxas_tp2.log \
+		tools/vocab_freq tools/llama_ref

@@ -2,6 +2,8 @@
 *.o
 qwen38_mk
 libqwen38mk.so
+qwen38_mk_tp2
+libqwen38mk_tp2.so
 ptxas*.log
 tools/vocab_freq
 tools/llama_ref
@@ -17,3 +19,5 @@ bench/*_tmp/
 draft_vocab_48k.bin
 # written by openjet setup (src/megakernel_build.py)
 .openjet-build.json
+# IDE
+.idea/

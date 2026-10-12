@@ -110,8 +110,7 @@ __device__ __forceinline__ unsigned h2u(__half2 h) { return *reinterpret_cast<un
 // GLU: W2 holds the up matrix (same type and shape as W = gate); the CTA computes 64 gate rows
 // (warps 0-3) and the same 64 up rows (warps 4-7) and writes silu(gate) * up as fp16.
 template <int TYPE, bool GLU = false>
-__global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok, Out O, const uint8_t * W2 = nullptr) {
-    static_assert(!GLU || TYPE == TQ4K, "fused gate / up is only built for Q4_K");
+__global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok, Out O, const uint8_t * W2 = nullptr, const __half * W2d = nullptr) {
     extern __shared__ __align__(16) uint8_t sm[];
     constexpr int BLK = WT<TYPE>::BLK, NCH = WT<TYPE>::NCH, SR = HT<TYPE>::SR, NSH = HT<TYPE>::NS;
     constexpr int STG = hm_stage<TYPE>();
@@ -138,8 +137,9 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
         winc[k] = inc;
         wdst[k] = r * SR + 16 * (TYPE == TQ6K ? c ^ ((r >> 1) & 3) : c);
     }
-    const uint8_t * esrc = W.w + (size_t) (row0 + (tid & (BM - 1))) * W.rb + 192;
-    const __half * dsrc = W.d + (size_t) (row0 + (tid & (BM - 1))) * W.nd;
+    // GLU: upper tile half (rows >= BM/2) is the up matrix, mapped back onto the same physical rows as the gate half
+    const uint8_t * esrc = (GLU && (tid & (BM - 1)) >= BM / 2 ? W2 : W.w) + (size_t) (row0 + (GLU ? ((tid & (BM - 1)) & (BM / 2 - 1)) : (tid & (BM - 1)))) * W.rb + 192;
+    const __half * dsrc = (GLU && (tid & (BM - 1)) >= BM / 2 ? W2d : W.d) + (size_t) (row0 + (GLU ? ((tid & (BM - 1)) & (BM / 2 - 1)) : (tid & (BM - 1)))) * W.nd;
     const unsigned edst = (tid & (BM - 1)) * SR + (TYPE == TQ6K ? 16 * (3 ^ (((tid & (BM - 1)) >> 1) & 3)) : 64);
     const __half * xsrc[4];
     unsigned xdst[4];
