@@ -3614,6 +3614,7 @@ int MKEngine::prefill(const std::vector<int> & tokens) {
     const std::vector<int> feed(seq.begin() + n0, seq.end());
     c.mtp_valid = std::min(c.mtp_valid, n0);
     size_t i = 0;
+    bool saved_ck = false;
     const char * mode = getenv("MK_PREFILL");
     const bool batched = !(mode && std::string(mode) == "mk");
     if (batched && feed.size() >= 2) {
@@ -3624,6 +3625,12 @@ int MKEngine::prefill(const std::vector<int> & tokens) {
         i = head.size();
         c.dn_c = n0 + (int) i;
         c.mtp_valid = c.dn_c;
+        // Checkpoint before the last prompt token: the next request's re-rendered history re-tokenizes
+        // the generation prompt's tail, so a checkpoint after it would never lie inside the common prefix.
+        c.n = c.dn_c;
+        p_->put_ctl(c);
+        p_->ck_save();
+        saved_ck = true;
     }
     while (i < feed.size()) {
         const int T = (int) std::min<size_t>(MAXT, feed.size() - i);
@@ -3639,7 +3646,7 @@ int MKEngine::prefill(const std::vector<int> & tokens) {
     p_->nd_avail = p_->ndraft;
     p_->all_acc = true;
     CK(cudaGetLastError());
-    p_->ck_save();
+    if (!saved_ck) p_->ck_save();
     seq.push_back(c.out[0]);
     return c.out[0];
 }

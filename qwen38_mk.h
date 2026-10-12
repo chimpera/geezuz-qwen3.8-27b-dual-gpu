@@ -35,7 +35,7 @@ class MKEngine {
     // positions folded into the recurrent state (truncate() can only go back to there).
     const std::vector<int> & sequence() const;
     int committed() const;
-    // Each prefill saves a checkpoint at the end of its prompt; rewinding to it drops everything
+    // Each prefill saves a checkpoint just before the last token of its prompt; rewinding to it drops everything
     // after (also tokens before the committed position), so a prompt that diverges anywhere after
     // the checkpoint can be re-fed from there.  Returns false when there is no checkpoint.
     int checkpoint_pos() const;

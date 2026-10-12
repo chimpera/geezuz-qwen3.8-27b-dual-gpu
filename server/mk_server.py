@@ -342,6 +342,8 @@ class Server:
                 break
             lcp += 1
         lcp = min(lcp, len(toks) - 1)  # at least one token is fed (it produces the next one)
+        log(f"reuse: cached {len(seq)}, prompt {len(toks)}, common prefix {lcp}, "
+            f"committed {eng.committed()}, checkpoint {eng.checkpoint_pos()}")
         if seq and lcp >= eng.committed():
             eng.truncate(lcp)
             return eng.prefill(toks[lcp:]), lcp
