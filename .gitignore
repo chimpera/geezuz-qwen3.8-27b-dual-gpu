@@ -21,3 +21,5 @@ draft_vocab_48k.bin
 .openjet-build.json
 # IDE
 .idea/
+# Python
+__pycache__/

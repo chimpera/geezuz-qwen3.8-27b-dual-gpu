@@ -3599,7 +3599,7 @@ void MKEngine::reset() {
 
 int MKEngine::position() const { return p_->hctl.n; }
 
-int MKEngine::prefill(const std::vector<int> & tokens) {
+int MKEngine::prefill(const std::vector<int> & tokens, bool save_checkpoint) {
     if (tokens.empty()) throw std::runtime_error("empty prompt");
     Ctl & c = p_->hctl;
     p_->get_ctl(c);
@@ -3629,7 +3629,7 @@ int MKEngine::prefill(const std::vector<int> & tokens) {
         // the generation prompt's tail, so a checkpoint after it would never lie inside the common prefix.
         c.n = c.dn_c;
         p_->put_ctl(c);
-        p_->ck_save();
+        if (save_checkpoint) p_->ck_save();
         saved_ck = true;
     }
     while (i < feed.size()) {
@@ -3646,7 +3646,7 @@ int MKEngine::prefill(const std::vector<int> & tokens) {
     p_->nd_avail = p_->ndraft;
     p_->all_acc = true;
     CK(cudaGetLastError());
-    if (!saved_ck) p_->ck_save();
+    if (save_checkpoint && !saved_ck) p_->ck_save();
     seq.push_back(c.out[0]);
     return c.out[0];
 }

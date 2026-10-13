@@ -23,8 +23,9 @@ class MKEngine {
     // Clears all sequence state (KV, recurrent state, positions).
     void reset();
     // Processes the prompt, or appends `tokens` to the sequence so far (prompt + emitted tokens,
-    // e.g. the next user turn); returns the first generated token (greedy).
-    int prefill(const std::vector<int> & tokens);
+    // e.g. the next user turn); returns the first generated token (greedy).  save_checkpoint=false keeps
+    // the previous checkpoint (tokens forced into a running generation are not a prompt).
+    int prefill(const std::vector<int> & tokens, bool save_checkpoint = true);
     // Sampling: temp 0 = greedy (default); otherwise llama.cpp's order top_k (1..32), top_p, min_p,
     // temperature.  Speculative verification keeps the sampled distribution exact.
     void set_sampling(float temp, float top_p, int top_k, float min_p, unsigned long long seed);

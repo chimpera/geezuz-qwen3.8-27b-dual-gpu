@@ -11,6 +11,8 @@ via `tools`), reasoning is returned as `reasoning_content`, Qwen's XML tool call
 conversation reuse the processed tokens: the new prompt is matched against the sequence so far and
 only the rest is prefilled (rewinding to the end of the previous prompt if it diverges after that).
 GET /health, GET /v1/models.  One request at a time.
+GET /status: what the engine is doing now (phase, live token count, tail of the reasoning / text / tool call
+being generated) and the stats of the last finished request; answered without waiting for a running request.
 """
 import argparse
 import codecs
@@ -29,7 +31,10 @@ import jinja2
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# Forced into the reasoning when the thinking budget runs out, so the model answers instead of hitting max_tokens.
+THINK_STOP = "\n\nI have thought enough and will answer now based on the reasoning so far.\n</think>\n\n"
 TOPK_MAX = 32
+STATUS_TAIL = 400  # characters of reasoning / text / tool call (or of a tool argument) GET /status shows
 
 
 def log(*a):
@@ -52,6 +57,7 @@ class Engine:
             "mk_set_sampling": (ctypes.c_int, [vp, ctypes.c_float, ctypes.c_float, ctypes.c_int, ctypes.c_float,
                                                ctypes.c_ulonglong]),
             "mk_prefill": (ctypes.c_int, [vp, ip, ctypes.c_int]),
+            "mk_append": (ctypes.c_int, [vp, ip, ctypes.c_int]),
             "mk_step": (ctypes.c_int, [vp, ip, ctypes.c_int]),
             "mk_reset": (None, [vp]),
             "mk_truncate": (ctypes.c_int, [vp, ctypes.c_int]),
@@ -109,6 +115,13 @@ class Engine:
         r = self.L.mk_prefill(self.h, arr, len(toks))
         if r < 0:
             raise self._err("prefill")
+        return r
+
+    def append(self, toks):
+        arr = (ctypes.c_int * len(toks))(*toks)
+        r = self.L.mk_append(self.h, arr, len(toks))
+        if r < 0:
+            raise self._err("append")
         return r
 
     def step(self):
@@ -295,6 +308,7 @@ class Server:
         self.model_id = os.path.basename(args.model)
         self.lock = threading.Lock()
         self.warned = set()
+        self.status = {"busy": False, "phase": "idle", "action": None, "last": None, "updated": time.time()}
         log(f"ready in {time.time() - t0:.1f} s: {self.model_id}, ctx {args.ctx}, {args.draft} drafts")
 
     def warm_up(self):
@@ -373,7 +387,30 @@ class Server:
         else:
             self.eng.set_sampling(temp, top_p, top_k, min_p, seed)
 
+    def track(self, **kw):
+        """updates the /status snapshot; a new dict each time, so a reader never sees it half-written"""
+        self.status = {**self.status, **kw, "updated": time.time()}
+
+    def live(self, parser, tail, n_gen, elapsed):
+        """/status fields while tokens are generated: the phase and the tail of what it is producing"""
+        if parser.mode == "tools":
+            phase, text = "tool_call", parser.tool_text[-STATUS_TAIL:]
+        elif parser.mode == "reasoning":
+            phase, text = "thinking", tail["reasoning"]
+        else:
+            phase, text = "writing", tail["content"]
+        return {"phase": phase, "gen": n_gen, "tok_s": n_gen / max(elapsed, 1e-9),
+                "action": {"kind": phase, "text": text}}
+
     def generate(self, body, emit):
+        """generate_once with the /status bookkeeping around it"""
+        self.track(busy=True, phase="prefill", gen=0, tok_s=0.0, started=time.time())
+        try:
+            return self.generate_once(body, emit)
+        finally:
+            self.track(busy=False, phase="idle")
+
+    def generate_once(self, body, emit):
         """runs one chat completion; emit(kind, payload) is called with ('reasoning'|'content', text) deltas.
         Returns (finish_reason, tool_calls, usage). emit returning False aborts."""
         text, thinking = self.render(body)
@@ -386,26 +423,49 @@ class Server:
         max_new = limit if max_new <= 0 else min(max_new, limit)
         tools = body.get("tools") or []
         self.sampling(body)
+        self.track(ctx=len(toks))
         t0 = time.time()
         tok, reused = self.load_prompt(toks)
         t1 = time.time()
         parser = OutputParser(thinking, tools)
         dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
-        n_gen, finish, pending, aborted = 0, "length", [tok], False
+        tail, shown = {"reasoning": "", "content": ""}, 0.0
+
+        def show(kind, delta):
+            tail[kind] = (tail[kind] + delta)[-STATUS_TAIL:]
+            return emit(kind, delta)
+
+        budget = body.get("thinking_budget", (body.get("chat_template_kwargs") or {}).get("thinking_budget",
+                                                                                         self.args.think_budget))
+        budget = int(budget or 0) if thinking else 0
+        n_gen, n_think, finish, pending, aborted = 0, 0, "length", [tok], False
         while n_gen < max_new and not aborted:
             if not pending:
-                pending = self.eng.step()
+                if budget and n_think >= budget and parser.mode == "reasoning":
+                    # Only between cycles: tokens still pending are already in the sequence and must not be skipped.
+                    pending = [self.eng.append(self.eng.tokenize(THINK_STOP))]
+                    for kind, delta in parser.feed(THINK_STOP):
+                        show(kind, delta)
+                    log(f"thinking budget of {budget} tokens reached")
+                    budget = 0
+                else:
+                    pending = self.eng.step()
             t = pending.pop(0)
             n_gen += 1
+            if parser.mode == "reasoning":
+                n_think += 1
+            if time.time() - shown >= 0.25:
+                shown = time.time()
+                self.track(**self.live(parser, tail, n_gen, shown - t1))
             if self.eng.is_eog(t):
                 finish = "stop"
                 break
             for kind, delta in parser.feed(dec.decode(self.eng.piece(t))):
-                if emit(kind, delta) is False:
+                if show(kind, delta) is False:
                     aborted = True
                     break
         for kind, delta in parser.feed(dec.decode(b"", final=True), final=True):
-            emit(kind, delta)
+            show(kind, delta)
         calls = parse_tool_calls(parser.tool_text, tools) if parser.tool_text else []
         if calls:
             finish = "tool_calls"
@@ -416,6 +476,14 @@ class Server:
                  "prompt_tokens_details": {"cached_tokens": reused}}
         timings = {"prompt_n": len(toks) - reused, "prompt_ms": (t1 - t0) * 1e3, "predicted_n": n_gen,
                    "predicted_ms": (t2 - t1) * 1e3, "predicted_per_second": n_gen / max(t2 - t1, 1e-9)}
+        action = self.live(parser, tail, n_gen, t2 - t1)["action"]
+        if calls:
+            action = {"kind": "tool_call", "calls": [
+                {"name": c["function"]["name"],
+                 "arguments": {k: v[:STATUS_TAIL] if isinstance(v, str) else v
+                               for k, v in json.loads(c["function"]["arguments"]).items()}} for c in calls]}
+        self.track(action=action, last={"tok_s": timings["predicted_per_second"], "gen": n_gen, "ctx": len(toks),
+                                        "reused": reused, "prefill_s": t1 - t0, "finish": finish, "at": t2})
         return finish, calls, usage, timings
 
 
@@ -440,6 +508,8 @@ def make_handler(srv):
                 self._json(200, {"status": "ok"})
             elif path in ("/v1/models", "/models"):
                 self._json(200, {"object": "list", "data": [{"id": srv.model_id, "object": "model", "owned_by": "openjet"}]})
+            elif path == "/status":
+                self._json(200, srv.status)
             elif path == "/props":
                 self._json(200, {"default_generation_settings": {"n_ctx": srv.args.ctx}, "total_slots": 1})
             else:
@@ -548,6 +618,9 @@ def main():
                     help="engine library; libqwen38mk_tp2.so runs tensor-parallel on two GPUs (MK_DEVICES=a,b)")
     ap.add_argument("--kv", choices=["auto", "f16", "q8"], default="auto",
                     help="KV cache format (auto: q8_0 only when the fp16 cache does not fit)")
+    ap.add_argument("--think-budget", type=int, default=0,
+                    help="reasoning tokens per request before </think> is forced (0: unlimited); "
+                         "a request's thinking_budget overrides it")
     args = ap.parse_args()
     srv = Server(args)
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(srv))

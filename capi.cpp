@@ -91,6 +91,16 @@ int mk_prefill(void * hp, const int * toks, int n) {
     }
 }
 
+// appends tokens forced into the running generation, keeping the prompt checkpoint; returns the next token
+int mk_append(void * hp, const int * toks, int n) {
+    try {
+        return static_cast<Handle *>(hp)->eng->prefill(std::vector<int>(toks, toks + n), false);
+    } catch (const std::exception & e) {
+        g_err = e.what();
+        return -1;
+    }
+}
+
 // one decode cycle; writes 1..n_draft+1 tokens; returns the count (negative on error)
 int mk_step(void * hp, int * out, int cap) {
     try {
