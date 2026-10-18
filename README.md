@@ -25,6 +25,19 @@ Built on L-Forster's single-GPU megakernel from [open-jet](https://github.com/L-
 
 ## Quick start
 
+### Prebuilt (RTX 30)
+
+[Releases](https://github.com/ohgeebtw/geezuz-qwen3.8-27b-dual-gpu/releases) has `geezuz-v0.2.0-sm_86.tar.gz` for RTX 30 cards (sm_86): the one-GPU and two-GPU CLI and server libraries, libllama for the tokenizer, the server and the draft vocabulary. It needs Linux x86-64 with glibc 2.35+ (Ubuntu 22.04 or newer), NVIDIA driver 575.57+, Python 3 with `jinja2` for the server, and P2P for two GPUs (see [Two GPUs](#two-gpus)).
+
+```sh
+sha256sum -c geezuz-v0.2.0-sm_86.tar.gz.sha256
+tar xzf geezuz-v0.2.0-sm_86.tar.gz && cd geezuz-v0.2.0-sm_86
+MK_DEVICES=0,1 ./geezuz_tp2 -m Qwen3.8-27B-Q4_K_M.gguf -p "Write quicksort in C" -n 512 -d 4 --draft-vocab draft_vocab_32k.bin
+python3 server/mk_server.py -m Qwen3.8-27B-Q4_K_M.gguf --lib ./libgeezuz_tp2.so -c 16384 --slots 8
+```
+
+### From source
+
 You need:
 
 - CUDA 12+ (12.8+ for RTX 50 series)
@@ -43,16 +56,16 @@ cmake --build ../llama.cpp/build -j
 make   # one-GPU and two-GPU CLI + server libraries, tools; ARCH=sm_89 overrides the detected GPU
 
 # one GPU
-./qwen38_mk -m ../models/Qwen3.8-27B-Q4_K_M.gguf -p "Write quicksort in C" -n 512 -d 4 --draft-vocab draft_vocab_32k.bin
+./geezuz -m ../models/Qwen3.8-27B-Q4_K_M.gguf -p "Write quicksort in C" -n 512 -d 4 --draft-vocab draft_vocab_32k.bin
 # two GPUs (devices 0,1 by default)
-MK_DEVICES=0,1 ./qwen38_mk_tp2 -m ../models/Qwen3.8-27B-Q4_K_M.gguf -p "Write quicksort in C" -n 512 -d 4 --draft-vocab draft_vocab_32k.bin
+MK_DEVICES=0,1 ./geezuz_tp2 -m ../models/Qwen3.8-27B-Q4_K_M.gguf -p "Write quicksort in C" -n 512 -d 4 --draft-vocab draft_vocab_32k.bin
 # OpenAI-compatible server on two GPUs
-python3 server/mk_server.py -m ../models/Qwen3.8-27B-Q4_K_M.gguf --lib ./libqwen38mk_tp2.so -c 100000
+python3 server/mk_server.py -m ../models/Qwen3.8-27B-Q4_K_M.gguf --lib ./libgeezuz_tp2.so -c 100000
 # the same, up to 8 requests at once
-python3 server/mk_server.py -m ../models/Qwen3.8-27B-Q4_K_M.gguf --lib ./libqwen38mk_tp2.so -c 16384 --slots 8
+python3 server/mk_server.py -m ../models/Qwen3.8-27B-Q4_K_M.gguf --lib ./libgeezuz_tp2.so -c 16384 --slots 8
 ```
 
-To build on a remote GPU host inside a CUDA container: `docker/build.Dockerfile`, `scripts/box-sync.sh <ssh-host> <dir>`, `scripts/box-build.sh <ssh-host> <dir>`.
+`make release` builds the tarball in `dist/` (build llama.cpp with `-DGGML_NATIVE=OFF` and pass `LLAMA_BIN=<its bin dir>`; `docker/build.Dockerfile` with `--build-arg UBUNTU=22.04` gives the glibc 2.35 baseline). To build on a remote GPU host inside a CUDA container: `docker/build.Dockerfile`, `scripts/box-sync.sh <ssh-host> <dir>`, `scripts/box-build.sh <ssh-host> <dir>`.
 
 ## Results
 
@@ -179,8 +192,8 @@ To reproduce:
 make tools/llama_ref
 tools/llama_ref -m model.gguf -f code.txt -f prose.txt --score-from 1024 -b 1 --ref-out llama.ref
 tools/llama_ref -m model.gguf --kld llama.ref                                 # llama.cpp batched: the noise floor
-./qwen38_mk     -m model.gguf --kld llama.ref --score-path mixed --kv q8      # one GPU
-./qwen38_mk_tp2 -m model.gguf --kld llama.ref --score-path mixed --kv q8      # two GPUs
+./geezuz     -m model.gguf --kld llama.ref --score-path mixed --kv q8      # one GPU
+./geezuz_tp2 -m model.gguf --kld llama.ref --score-path mixed --kv q8      # two GPUs
 ```
 
 `llama_ref` teacher-forces 2,048-token chunks of the text (`--chunk`; `-b 1` for token by token; `--max-chunks` to limit) and stores the 256 most likely tokens per scored position (`logit_stats.h`). `--score-path`: `prefill` (default, the batched prefill kernels), `decode` (the decode kernel), or `mixed` (prefill for the unscored prompt, decode for the scored positions, as a generation runs).
@@ -189,7 +202,7 @@ tools/llama_ref -m model.gguf --kld llama.ref                                 # 
 
 ### Two GPUs
 
-`qwen38_mk_tp2` / `libqwen38mk_tp2.so` (`-DMK_TP=2`) split the model over two identical GPUs (tensor parallel). Each card runs its own copy of the megakernel on half of the weights. The cards send partial sums straight to each other over PCIe P2P, with a flag per item (no shared grid barrier), and add them in the same order, so both cards keep a bit-identical copy of the residual stream. Prefill runs one host thread per card with the same exchange.
+`geezuz_tp2` / `libgeezuz_tp2.so` (`-DMK_TP=2`) split the model over two identical GPUs (tensor parallel). Each card runs its own copy of the megakernel on half of the weights. The cards send partial sums straight to each other over PCIe P2P, with a flag per item (no shared grid barrier), and add them in the same order, so both cards keep a bit-identical copy of the residual stream. Prefill runs one host thread per card with the same exchange.
 
 Each card holds its attention q / KV heads, its DeltaNet value heads (card c owns heads h with `(h % 16) / 8 == c`), half of the FFN rows (8,704, padded to 9,216), half of the lm_head vocabulary (top-k / argmax merged across cards), its K half of the MTP `eh_proj` and half of the MTP draft vocabulary. Embeddings and norms are on both. Weights take 8.7 GB per card instead of 16.7 GB on one, which leaves room for long contexts with an fp16 KV cache.
 
@@ -246,7 +259,7 @@ Prompts go through ordinary kernel launches (`prefill.cuh`) in chunks of up to 2
 
 ## Server
 
-`server/mk_server.py`: OpenAI-compatible `/v1/chat/completions` (streaming or not), `/health`, `/v1/models`, `GET /status`, through `libqwen38mk.so` or, with `--lib`, `libqwen38mk_tp2.so` (C API in `capi.cpp`).
+`server/mk_server.py`: OpenAI-compatible `/v1/chat/completions` (streaming or not), `/health`, `/v1/models`, `GET /status`, through `libgeezuz.so` or, with `--lib`, `libgeezuz_tp2.so` (C API in `capi.cpp`).
 
 | flag | default | |
 |---|---|---|
@@ -255,7 +268,7 @@ Prompts go through ordinary kernel launches (`prefill.cuh`) in chunks of up to 2
 | `-c` | 32768 | context per slot |
 | `-d` | 4 | drafts per cycle |
 | `--draft-vocab` | | draft vocabulary file |
-| `--lib` | `libqwen38mk.so` | engine library |
+| `--lib` | `libgeezuz.so` | engine library |
 | `--kv` | auto | KV cache: `f16`, `q8`, or `auto` (fp16 unless it does not fit) |
 | `--slots` | 1 | requests decoded at once; more requests queue |
 
@@ -268,7 +281,7 @@ open-jet uses this server in place of `llama-server` (`openjet setup` builds the
 
 ## Options
 
-CLI (`qwen38_mk`, `qwen38_mk_tp2`):
+CLI (`geezuz`, `geezuz_tp2`):
 
 | flag | |
 |---|---|
@@ -352,7 +365,7 @@ llama-quantize Qwen3.8-27B-BF16-00001-of-00002.gguf Qwen3.8-27B-Q4_K_M.gguf Q4_K
 | `qwen38_mk.cu` / `qwen38_mk.h` | loader, repacking, the megakernel (one and two GPUs), the `MKEngine` API |
 | `batch.cuh` / `mma.cuh` / `q8_tile.h` | batched decode cycle, its tensor-core GEMVs, the Q8_0 tile layout |
 | `prefill.cuh` / `prefill_gemm.cuh` | prefill kernels and their fp16 GEMM |
-| `capi.cpp` | C API (engine + libllama tokenizer) for `libqwen38mk.so` / `libqwen38mk_tp2.so` |
+| `capi.cpp` | C API (engine + libllama tokenizer) for `libgeezuz.so` / `libgeezuz_tp2.so` |
 | `server/mk_server.py` | OpenAI-compatible server |
 | `main.cu` | CLI |
 | `gguf.h` | minimal mmap GGUF reader |

@@ -4,7 +4,7 @@
 //
 //   llama_ref -m model.gguf -f text [-f text ...] --ref-out llama.ref    reference from text files
 //   llama_ref -m model.gguf --kld llama.ref -ngl 0                       another llama.cpp setup against it
-//   qwen38_mk -m model.gguf --kld llama.ref                              the megakernel against it
+//   geezuz -m model.gguf --kld llama.ref                              the megakernel against it
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>

@@ -799,8 +799,8 @@ def main():
     ap.add_argument("-c", "--ctx", type=int, default=32768)
     ap.add_argument("-d", "--draft", type=int, default=4)
     ap.add_argument("--draft-vocab", default=os.path.join(os.path.dirname(HERE), "draft_vocab_32k.bin"))
-    ap.add_argument("--lib", default=os.path.join(os.path.dirname(HERE), "libqwen38mk.so"),
-                    help="engine library; libqwen38mk_tp2.so runs tensor-parallel on two GPUs (MK_DEVICES=a,b)")
+    ap.add_argument("--lib", default=os.path.join(os.path.dirname(HERE), "libgeezuz.so"),
+                    help="engine library; libgeezuz_tp2.so runs tensor-parallel on two GPUs (MK_DEVICES=a,b)")
     ap.add_argument("--kv", choices=["auto", "f16", "q8"], default="auto",
                     help="KV cache format (auto: q8_0 only when the fp16 cache does not fit)")
     ap.add_argument("--slots", type=int, default=1,

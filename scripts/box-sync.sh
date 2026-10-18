@@ -13,10 +13,10 @@ ssh "$HOST" mkdir -p -- "$REMOTE_DIR/geezuz-qwen3.8-27b-dual-gpu"
 rsync -avz --delete \
 	--exclude .git \
 	--exclude '*.o' \
-	--exclude qwen38_mk \
-	--exclude libqwen38mk.so \
-	--exclude qwen38_mk_tp2 \
-	--exclude libqwen38mk_tp2.so \
+	--exclude geezuz \
+	--exclude libgeezuz.so \
+	--exclude geezuz_tp2 \
+	--exclude libgeezuz_tp2.so \
 	--exclude 'ptxas*.log' \
 	--exclude tools/vocab_freq \
 	--exclude tools/llama_ref \

@@ -15,7 +15,7 @@
 
 static void usage() {
     fprintf(stderr,
-            "usage: qwen38_mk -m model.gguf [-p prompt | -f prompt_file] [-n n_predict] [-d n_draft]\n"
+            "usage: geezuz -m model.gguf [-p prompt | -f prompt_file] [-n n_predict] [-d n_draft]\n"
             "                 [-c ctx] [--draft-vocab ids.bin] [--raw] [--ids] [--quiet]\n"
             "                 [--turn2 text | --turn2-file f]   (a second user turn, appended to the first)\n"
             "                 [--prompt-ids f]   (prompt given as whitespace-separated token ids)\n"

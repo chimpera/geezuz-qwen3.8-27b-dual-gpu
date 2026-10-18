@@ -21,7 +21,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 MODEL = os.path.join(ROOT, "models", "Qwen3.8-27B-Q4_K_M.gguf")
 LLAMA_SERVER = os.path.join(ROOT, "llama.cpp", "build", "bin", "llama-server")
-MK = os.path.join(os.path.dirname(HERE), "qwen38_mk")
+MK = os.path.join(os.path.dirname(HERE), "geezuz")
 
 
 def chat(prompt: str) -> str:

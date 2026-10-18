@@ -1,9 +1,9 @@
 # build outputs
 *.o
-qwen38_mk
-libqwen38mk.so
-qwen38_mk_tp2
-libqwen38mk_tp2.so
+geezuz
+libgeezuz.so
+geezuz_tp2
+libgeezuz_tp2.so
 ptxas*.log
 tools/vocab_freq
 tools/llama_ref
@@ -23,3 +23,5 @@ draft_vocab_48k.bin
 .idea/
 # Python
 __pycache__/
+# release tarballs (make release)
+dist/

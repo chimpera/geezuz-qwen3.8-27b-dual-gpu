@@ -1,6 +1,6 @@
 # Changelog
 
-## Batched decode: up to 8 requests in one cycle
+## v0.2.0: batched decode, up to 8 requests in one cycle
 
 Two RTX 3090s, 8 parallel requests, total tok/s: **Q4_K_M 298 to 624 (2.1x)**, Q8_0 561 to 595. One request: Q4_K_M 186 tok/s, Q8_0 141.
 
@@ -52,6 +52,7 @@ The step record shows where the remaining time goes: the system fence after send
 
 ### Also in this release
 
+- Project name Geezuz; binaries `geezuz`, `geezuz_tp2`, `libgeezuz.so`, `libgeezuz_tp2.so`; prebuilt sm_86 tarball (`make release`).
 - `mk_server.py --slots N`: scheduler thread, request queue, slot assignment by longest cached prefix, prefill between cycles, per-slot streams and `/status`.
 - CLI `--slots N` with a per-slot comparison against a solo run; `bench/batch_bench.py` (server or llama-server `--parallel`); `bench/kq_mma_bench.cu`, `bench/q6_dp4a_bench.cu`.
 - `MK_OPT`, `MK_BATCH_ROWS`, `MK_PROFILE=batch` (see the README's [Options](README.md#options)).
