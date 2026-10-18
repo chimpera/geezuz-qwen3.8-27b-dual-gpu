@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the megakernel on a remote box, all inside a container (no GPU used):
 #   scripts/box-build.sh <ssh-host> <remote-dir>
-# Expects the repo synced to <remote-dir>/dual-gpu-megakernel (box-sync.sh).
+# Expects the repo synced to <remote-dir>/geezuz-qwen3.8-27b-dual-gpu (box-sync.sh).
 # Clones llama.cpp (tag below) to <remote-dir>/llama.cpp if missing, builds a
 # CPU-only shared libllama from it, then runs make in the sources. The whole
 # <remote-dir> is bind-mounted into the container at its own absolute path.
@@ -18,7 +18,7 @@ case "$REMOTE_DIR" in
 	"~") REMOTE_DIR=$HOME ;;
 	"~/"*) REMOTE_DIR=$HOME/"${REMOTE_DIR#~/}" ;;
 esac
-SRC=$REMOTE_DIR/dual-gpu-megakernel
+SRC=$REMOTE_DIR/geezuz-qwen3.8-27b-dual-gpu
 LLAMA=$REMOTE_DIR/llama.cpp
 LLAMA_TAG=b10246
 LLAMA_REPO=https://github.com/ggml-org/llama.cpp
@@ -60,6 +60,6 @@ docker run --rm \
 		-DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
 		-DGGML_BACKEND=CPU -DGGML_CUDA=OFF -DBUILD_EXAMPLES=OFF
 	cmake --build llama.cpp/build -j"$(nproc)"
-	make -C dual-gpu-megakernel -j"$(nproc)"
+	make -C geezuz-qwen3.8-27b-dual-gpu -j"$(nproc)"
 '
 REMOTE

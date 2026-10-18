@@ -17,10 +17,17 @@ class MKEngine {
     // draft_vocab: optional file of int32 token ids; the MTP draft head is restricted to them.
     // kv_mode: KV cache format, 0 fp16, 1 q8_0 (half the memory, ~1-2% slower), -1 auto (q8_0 only
     // when the fp16 cache for ctx positions does not fit in the free GPU memory).
-    MKEngine(const std::string & gguf_path, int ctx, int n_draft, const std::string & draft_vocab = "", int kv_mode = -1);
+    // n_seq: sequence slots (1..8), each with its own KV cache of ctx tokens, recurrent state and checkpoint.
+    MKEngine(const std::string & gguf_path, int ctx, int n_draft, const std::string & draft_vocab = "", int kv_mode = -1,
+             int n_seq = 1);
     ~MKEngine();
 
-    // Clears all sequence state (KV, recurrent state, positions).
+    // Every call below acts on the selected sequence slot (0 after construction).
+    void select(int s);
+    int selected() const;
+    int n_seq() const;
+
+    // Clears the selected slot's sequence state (KV, recurrent state, positions).
     void reset();
     // Processes the prompt, or appends `tokens` to the sequence so far (prompt + emitted tokens,
     // e.g. the next user turn); returns the first generated token (greedy).  save_checkpoint=false keeps
@@ -43,6 +50,12 @@ class MKEngine {
     bool rewind_to_checkpoint();
     // Runs one verify+draft cycle; appends 1..n_draft+1 accepted tokens to `out`.
     int step(std::vector<int> & out);
+    // One cycle for several distinct slots at once; outs[i] receives slot slots[i]'s tokens (appended).  TP=2
+    // builds run them in one launch whose GEMVs share every weight read across the slots' rows (at most
+    // max_batch_rows() rows, 10 unless every matrix is Q8_0: fewer drafts per slot as slots are added); otherwise
+    // the slots step one by one.
+    void step_batch(const std::vector<int> & slots, std::vector<std::vector<int>> & outs);
+    static int max_batch_rows();
     // Debug helper: copy of the last main-model logits row selection (argmax ids) is not kept;
     // instead expose the final normalised hidden row of the last processed position.
     std::vector<float> last_hidden();

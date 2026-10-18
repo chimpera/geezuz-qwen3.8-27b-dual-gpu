@@ -23,7 +23,7 @@ extern "C" {
 
 const char * mk_last_error() { return g_err.c_str(); }
 
-void * mk_new(const char * model, int ctx, int n_draft, const char * draft_vocab, int kv_mode) {
+void * mk_new(const char * model, int ctx, int n_draft, const char * draft_vocab, int kv_mode, int n_seq) {
     try {
         llama_backend_init();
         llama_model_params mp = llama_model_default_params();
@@ -32,7 +32,7 @@ void * mk_new(const char * model, int ctx, int n_draft, const char * draft_vocab
         h->lm = llama_model_load_from_file(model, mp);
         if (!h->lm) throw std::runtime_error("failed to load the vocabulary");
         h->vocab = llama_model_get_vocab(h->lm);
-        h->eng = new MKEngine(model, ctx, n_draft, draft_vocab ? draft_vocab : "", kv_mode);
+        h->eng = new MKEngine(model, ctx, n_draft, draft_vocab ? draft_vocab : "", kv_mode, n_seq);
         return h;
     } catch (const std::exception & e) {
         g_err = e.what();
@@ -109,6 +109,35 @@ int mk_step(void * hp, int * out, int cap) {
         const int n = std::min((int) v.size(), cap);
         for (int i = 0; i < n; i++) out[i] = v[i];
         return n;
+    } catch (const std::exception & e) {
+        g_err = e.what();
+        return -1;
+    }
+}
+
+// later calls act on sequence slot s
+int mk_select(void * hp, int s) {
+    try {
+        static_cast<Handle *>(hp)->eng->select(s);
+        return 0;
+    } catch (const std::exception & e) {
+        g_err = e.what();
+        return -1;
+    }
+}
+
+int mk_n_seq(void * hp) { return static_cast<Handle *>(hp)->eng->n_seq(); }
+
+// one decode cycle for n distinct slots; slot slots[i] writes counts[i] tokens to out[i * cap ..]
+int mk_step_batch(void * hp, const int * slots, int n, int * out, int cap, int * counts) {
+    try {
+        std::vector<std::vector<int>> outs(n);
+        static_cast<Handle *>(hp)->eng->step_batch(std::vector<int>(slots, slots + n), outs);
+        for (int b = 0; b < n; b++) {
+            counts[b] = std::min((int) outs[b].size(), cap);
+            for (int i = 0; i < counts[b]; i++) out[b * cap + i] = outs[b][i];
+        }
+        return 0;
     } catch (const std::exception & e) {
         g_err = e.what();
         return -1;

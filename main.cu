@@ -22,6 +22,8 @@ static void usage() {
             "                 [--think [xhigh|medium|low]]   (reasoning mode, the chat template's default effort is xhigh)\n"
             "                 [--temp t] [--top-p p] [--top-k k] [--min-p p] [--seed s]   (default: greedy)\n"
             "                 [--kv f16|q8|auto]   (KV cache format; auto: q8_0 only when fp16 does not fit)\n"
+            "                 [--slots N]   (N sequence slots: N prompt variants decoded together in batched cycles, each\n"
+            "                     checked against a solo run of its own)\n"
             "                 [--kld ref [--ref-out f] [--score-path prefill|decode|mixed]]   (KL divergence, perplexity and\n"
             "                     top-token agreement against a reference file of tools/llama_ref or of --ref-out)\n");
     exit(1);
@@ -44,6 +46,7 @@ int main(int argc, char ** argv) {
     int top_k = 32;
     unsigned long long seed = 1;
     int kv_mode = -1;
+    int slots = 1;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { if (i + 1 >= argc) usage(); return argv[++i]; };
@@ -71,6 +74,7 @@ int main(int argc, char ** argv) {
         else if (a == "--min-p") min_p = atof(next().c_str());
         else if (a == "--seed") seed = strtoull(next().c_str(), nullptr, 10);
         else if (a == "--kv") { const std::string k = next(); kv_mode = k == "f16" ? 0 : k == "q8" ? 1 : -1; }
+        else if (a == "--slots") slots = atoi(next().c_str());
         else if (a == "--turn2-file") { std::ifstream f(next()); std::stringstream ss; ss << f.rdbuf(); turn2 = ss.str(); }
         else usage();
     }
@@ -127,7 +131,7 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
-    MKEngine eng(model, ctx, n_draft, draft_vocab, kv_mode);
+    MKEngine eng(model, ctx, n_draft, draft_vocab, kv_mode, slots);
     eng.set_sampling(temp, top_p, top_k, min_p, seed);
     if (bench_phases) {
         eng.bench_phases();
@@ -207,6 +211,58 @@ int main(int argc, char ** argv) {
                 n_dec, dc, n_dec / dc, cyc, ac, dr, dr ? 100.0 * ac / dr : 0.0, cyc ? (double) n_dec / cyc : 0.0);
         return std::make_pair(out, eog);
     };
+    if (slots > 1) {
+        // decode n_predict tokens per slot, all unfinished slots in one batched cycle
+        std::vector<std::vector<int>> pr(slots), got(slots);
+        for (int s = 0; s < slots; s++) {
+            pr[s] = tokenize(sys + "<|im_start|>user\n" + prompt + " (variant " + std::to_string(s) + ")<|im_end|>\n" + gen_prompt);
+            eng.select(s);
+            eng.set_sampling(temp, top_p, top_k, min_p, seed);
+            got[s] = {eng.prefill(pr[s])};
+        }
+        const MKStats s0 = eng.stats;
+        auto t0 = std::chrono::steady_clock::now();
+        for (;;) {
+            std::vector<int> act;
+            for (int s = 0; s < slots; s++)
+                if ((int) got[s].size() < n_predict) act.push_back(s);
+            if (act.empty()) break;
+            std::vector<std::vector<int>> o;
+            eng.step_batch(act, o);
+            for (size_t i = 0; i < act.size(); i++) got[act[i]].insert(got[act[i]].end(), o[i].begin(), o[i].end());
+        }
+        const double dc = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        long n_dec = 0;
+        for (auto & g : got) {
+            g.resize(n_predict);
+            n_dec += n_predict - 1;
+        }
+        if (print_ids)
+            for (int s = 0; s < slots; s++) {
+                printf("SLOT%d:", s);
+                for (int id : got[s]) printf(" %d", id);
+                printf("\n");
+            }
+        const long dr = eng.stats.drafted - s0.drafted, ac = eng.stats.accepted - s0.accepted;
+        fprintf(stderr, "[mk-slots] %d slots batched: %ld tok in %.3f s = %.2f tok/s total, %ld cycles, accepted %ld/%ld drafts (%.1f%%)\n",
+                slots, n_dec, dc, n_dec / dc, eng.stats.cycles - s0.cycles, ac, dr, dr ? 100.0 * ac / dr : 0.0);
+        int bad = 0;
+        for (int s = 0; s < slots; s++) {
+            eng.select(s);
+            eng.reset();
+            std::vector<int> solo = {eng.prefill(pr[s])};
+            while ((int) solo.size() < n_predict) eng.step(solo);
+            solo.resize(n_predict);
+            int diff = -1;
+            for (int i = 0; i < n_predict && diff < 0; i++)
+                if (solo[i] != got[s][i]) diff = i;
+            if (diff >= 0) bad++;
+            fprintf(stderr, "[mk-slots] slot %d: %s", s, diff < 0 ? "identical to its solo run\n" : "differs from its solo run at token ");
+            if (diff >= 0) fprintf(stderr, "%d\n", diff);
+        }
+        llama_model_free(lm);
+        return bad ? 2 : 0;
+    }
     const int plen = (int) prompt_ids.size();
     auto [out1, eog1] = turn(prompt_ids, "IDS");
     if (!turn2.empty()) {

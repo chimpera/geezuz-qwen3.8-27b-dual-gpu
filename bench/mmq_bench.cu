@@ -49,9 +49,9 @@ __device__ float deq(const WMat & W, int row, int e) {
         return d * sc * ((lo | (hi << 4)) - 32);
     } else {
         const int p = w >> 6, ww = w & 63, sub = ww >> 5, i = ww & 31, hh = i >> 4, ii = i & 15;
-        const int u = 8 * b + 2 * p + hh;
-        const int8_t q = (int8_t) r[32 * u + 16 * sub + ii];
-        return __half2float(W.d[(size_t) row * W.nd + (e >> 5)]) * q;
+        const int u = 8 * b + 2 * p + hh, j = e >> 5;
+        const int8_t q = (int8_t) W.w[q8_wo(row, W.rb) + Q8_GW * (u >> 1) + 32 * (u & 1) + 16 * sub + ii];
+        return __half2float(W.d[q8_do(row, W.nd) + Q8_GD * (j >> 1) + (j & 1)]) * q;
     }
 }
 

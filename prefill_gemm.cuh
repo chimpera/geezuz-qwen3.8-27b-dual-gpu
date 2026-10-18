@@ -15,6 +15,8 @@
 #include <cstdint>
 #include <type_traits>
 
+#include "q8_tile.h"
+
 namespace pf {
 
 constexpr int BM = 128, BN = 128, BK = 64;
@@ -132,14 +134,15 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
         int off, inc;
         chunk_src<TYPE>(c, off, inc);
         const int rr = i < WCH ? r : 0;
-        wsrc[k] = GLU ? (rr < BM / 2 ? W.w : W2) + (size_t) (row0 + (rr & (BM / 2 - 1))) * W.rb + off
-                      : W.w + (size_t) (row0 + rr) * W.rb + off;
+        const int wr = GLU ? row0 + (rr & (BM / 2 - 1)) : row0 + rr;
+        wsrc[k] = (GLU && rr >= BM / 2 ? W2 : W.w) + (TYPE == TQ80 ? q8_wo(wr, W.rb) : kq_wo(wr, W.rb, BLK)) + off;
         winc[k] = inc;
         wdst[k] = r * SR + 16 * (TYPE == TQ6K ? c ^ ((r >> 1) & 3) : c);
     }
     // GLU: upper tile half (rows >= BM/2) is the up matrix, mapped back onto the same physical rows as the gate half
-    const uint8_t * esrc = (GLU && (tid & (BM - 1)) >= BM / 2 ? W2 : W.w) + (size_t) (row0 + (GLU ? ((tid & (BM - 1)) & (BM / 2 - 1)) : (tid & (BM - 1)))) * W.rb + 192;
-    const __half * dsrc = (GLU && (tid & (BM - 1)) >= BM / 2 ? W2d : W.d) + (size_t) (row0 + (GLU ? ((tid & (BM - 1)) & (BM / 2 - 1)) : (tid & (BM - 1)))) * W.nd;
+    const uint8_t * esrc = (GLU && (tid & (BM - 1)) >= BM / 2 ? W2 : W.w) + kq_wo(row0 + (GLU ? ((tid & (BM - 1)) & (BM / 2 - 1)) : (tid & (BM - 1))), W.rb, BLK) + 192;
+    const int drow = row0 + (GLU ? ((tid & (BM - 1)) & (BM / 2 - 1)) : (tid & (BM - 1)));
+    const __half * dsrc = (GLU && (tid & (BM - 1)) >= BM / 2 ? W2d : W.d) + (TYPE == TQ80 ? q8_do(drow, W.nd) : (size_t) drow * W.nd);
     const unsigned edst = (tid & (BM - 1)) * SR + (TYPE == TQ6K ? 16 * (3 ^ (((tid & (BM - 1)) >> 1) & 3)) : 64);
     const __half * xsrc[4];
     unsigned xdst[4];
@@ -155,11 +158,11 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
         const int sb = st >> 2, p = st & 3;
 #pragma unroll
         for (int k = 0; k < WIT; k++)
-            if (WCH % 256 == 0 || tid + k * 256 < WCH) cpa16(s + wdst[k], wsrc[k] + sb * BLK + p * winc[k]);
+            if (WCH % 256 == 0 || tid + k * 256 < WCH) cpa16(s + wdst[k], wsrc[k] + (TYPE == TQ80 ? (size_t) Q8_GW * st : (size_t) sb * KQ_T * BLK + p * winc[k]));
         if constexpr (TYPE == TQ6K) {
-            if (tid < BM) cpa8(s + edst, esrc + sb * BLK + 8 * p);
+            if (tid < BM) cpa8(s + edst, esrc + (size_t) sb * KQ_T * BLK + 8 * p);
         } else if constexpr (TYPE == TQ80) {
-            if (tid < BM) cpa4(s + edst, dsrc + 2 * st);
+            if (tid < BM) cpa4(s + edst, dsrc + Q8_GD * st);
         }
 #pragma unroll
         for (int k = 0; k < 4; k++) cpa16(s + xdst[k], xsrc[k] + BK * st);
