@@ -375,6 +375,21 @@ __device__ __forceinline__ void gsync(unsigned & epoch, int tag) {
 #if MK_TP > 1
 // Cross-GPU reduce/flag primitives. Flags are never reset per launch: the tag embeds Launch.gen,
 // so a stale flag from an earlier launch simply has an old gen and is not accepted.
+// one reduce item slot: OPT_XR8 sends LL words {4 B payload, 4 B tag} (MAXR*8 int8 words, then MAXR
+// scale words); the bf16 path uses the first MAXR*32 bf16 of the slot
+constexpr int XR_QW = MAXR * 8, XR_LLW = XR_QW + MAXR, XR_SLOT = XR_LLW * 4;
+__device__ __forceinline__ __nv_bfloat16 * xr_slot(__nv_bfloat16 * b, int j) { return b + j * XR_SLOT; }
+__device__ __forceinline__ void ll_store(uint2 * p, unsigned v, unsigned t) {
+    asm volatile("st.volatile.global.v2.u32 [%0], {%1, %2};" ::"l"(p), "r"(v), "r"(t) : "memory");
+}
+// the 8-byte load is single-copy atomic, so a matching tag means its payload is the new one
+__device__ __forceinline__ unsigned ll_load(const uint2 * p, unsigned t) {
+    unsigned v, g;
+    for (;;) {
+        asm volatile("ld.volatile.global.v2.u32 {%0, %1}, [%2];" : "=r"(v), "=r"(g) : "l"(p) : "memory");
+        if (g == t) return v;
+    }
+}
 __device__ __forceinline__ unsigned tag_of(int k) {
     // k is the reduction index within a launch; keep k < 4096 (1<<12) so it fits the low 12 bits
     return (L.gen << 12) | (unsigned) k;
@@ -392,12 +407,12 @@ __device__ __forceinline__ unsigned flag_acquire_sys(const unsigned * p) {
 }
 // send this block's partial for item j to the peer, then release the peer's flag j
 // The PCIe link is the all-reduce bottleneck, so partials cross it as bf16, or with OPT_XR8 as int8 per
-// 32 values (item slot: MAXR * 32 int8, then MAXR float scales); n is a multiple of 32.  The own partial
+// 32 values (LL words, see XR_SLOT); n is a multiple of 32.  The own partial
 // is rounded in place the same way, so both cards sum identical values.
 __device__ __forceinline__ void xr_send(int j, int k, float * part, int n) {
     if (cB.opt & OPT_XR8) {
-        int8_t * dq = reinterpret_cast<int8_t *>(cB.peer_xr[k & 1] + j * MAXR * 32);
-        float * ds = reinterpret_cast<float *>(dq + MAXR * 32);
+        uint2 * dw = reinterpret_cast<uint2 *>(xr_slot(cB.peer_xr[k & 1], j));
+        const unsigned tg = tag_of(k);
         for (int i = threadIdx.x; i < n / 8; i += NT) {
             float * p = part + 8 * i;
             float am = 0.f;
@@ -415,12 +430,13 @@ __device__ __forceinline__ void xr_send(int j, int k, float * part, int n) {
                 qb[e] = (int8_t) __float2int_rn(p[e] * inv);
                 p[e] = qb[e] * d;
             }
-            reinterpret_cast<int2 *>(dq)[i] = *reinterpret_cast<const int2 *>(q);
-            if ((i & 3) == 0) ds[i >> 2] = d;
+            ll_store(dw + 2 * i, *reinterpret_cast<const unsigned *>(&q[0]), tg);
+            ll_store(dw + 2 * i + 1, *reinterpret_cast<const unsigned *>(&q[1]), tg);
+            if ((i & 3) == 0) ll_store(dw + XR_QW + (i >> 2), __float_as_uint(d), tg);
         }
         return;
     }
-    uint4 * dst = reinterpret_cast<uint4 *>(cB.peer_xr[k & 1] + j * MAXR * 32);
+    uint4 * dst = reinterpret_cast<uint4 *>(xr_slot(cB.peer_xr[k & 1], j));
     for (int i = threadIdx.x; i < n / 8; i += NT) {
         float * p = part + 8 * i;
         __nv_bfloat162 h[4];
@@ -437,9 +453,12 @@ __device__ __forceinline__ void xr_send(int j, int k, float * part, int n) {
 __device__ __forceinline__ void xr_release(int n_items, int k) {
     __syncthreads();
     mark_step(PS_WRITTEN);
+    // LL words carry their own tag, so the int8 path needs neither the system fence nor the flags
     if (threadIdx.x == 0) {
-        __threadfence_system();
-        for (int i = 0; i < n_items; i++) flag_release_sys(cB.peer_fl + blockIdx.x + i * gridDim.x, tag_of(k));
+        if (!(cB.opt & OPT_XR8)) {
+            __threadfence_system();
+            for (int i = 0; i < n_items; i++) flag_release_sys(cB.peer_fl + blockIdx.x + i * gridDim.x, tag_of(k));
+        }
         mark_step(PS_SENT);
     }
 }
@@ -447,26 +466,32 @@ __device__ __forceinline__ void xr_put(int j, int k, float * part, int n) {
     xr_send(j, k, part, n);
     __syncthreads();
     mark_step(PS_WRITTEN);
-    if (threadIdx.x == 0) { __threadfence_system(); flag_release_sys(cB.peer_fl + j, tag_of(k)); }
+    if (threadIdx.x == 0 && !(cB.opt & OPT_XR8)) { __threadfence_system(); flag_release_sys(cB.peer_fl + j, tag_of(k)); }
     mark_step(PS_SENT);
 }
 // own partial (rounded by xr_send) plus the peer's
 __device__ __forceinline__ float xr_sum(float own, const __nv_bfloat16 * peer, int i) {
     float p;
     if (cB.opt & OPT_XR8) {
-        const int8_t * q = reinterpret_cast<const int8_t *>(peer);
-        p = __ldcg(q + i) * __ldcg(reinterpret_cast<const float *>(q + MAXR * 32) + (i >> 5));
+        // xr_wait saw every word of the item with the current tag, so plain L2 loads see them too
+        const unsigned * w = reinterpret_cast<const unsigned *>(peer);
+        const unsigned q = __ldcg(w + 2 * (i >> 2));
+        p = (float) (int8_t) (q >> (8 * (i & 3))) * __uint_as_float(__ldcg(w + 2 * (XR_QW + (i >> 5))));
     } else p = __bfloat162float(__ldcg(peer + i));
     return cB.rank == 0 ? own + p : p + own;
 }
-// wait for the peer's partial for item j to arrive; the caller then reads cB.xr[k & 1] + j*MAXR*32
-__device__ __forceinline__ void xr_wait(int j, int k) {
-    if (threadIdx.x == 0) {
-        if (PROF_B0) prof_wait_begin();
+// wait for the peer's n-value partial for item j to arrive; the caller then reads xr_slot(cB.xr[k & 1], j).
+// LL: the block polls each of the item's words once (n/4 data words, n/32 scale words)
+__device__ __forceinline__ void xr_wait(int j, int k, int n) {
+    if (PROF_B0) prof_wait_begin();
+    if (cB.opt & OPT_XR8) {
+        const uint2 * w = reinterpret_cast<const uint2 *>(xr_slot(cB.xr[k & 1], j));
+        const int nq = n / 4, i = threadIdx.x;
+        if (i < nq + n / 32) ll_load(w + (i < nq ? i : XR_QW + i - nq), tag_of(k));
+    } else if (threadIdx.x == 0)
         while (!tag_reached(flag_acquire_sys(cB.fl + j), tag_of(k))) __nanosleep(32);
-        if (PROF_B0) prof_wait_end();
-    }
     __syncthreads();
+    if (PROF_B0) prof_wait_end();
     mark_step(PS_PEER);
 }
 // same send/flag exchange for the single lm_head slot
@@ -1158,9 +1183,9 @@ __device__ __noinline__ void resid32(const Mat W, const QBuf in, float * x, bool
         // K-sharded weights leave s_res a partial; all-reduce it before it touches x, summed
         // p0 + p1 in rank order so both cards get bit-identical values
         {
-            const __nv_bfloat16 * peer = cB.xr[k & 1] + j * MAXR * 32;
+            const __nv_bfloat16 * peer = xr_slot(cB.xr[k & 1], j);
             xr_put(j, k, s_res, T * 32);
-            xr_wait(j, k);
+            xr_wait(j, k, T * 32);
             for (int i = threadIdx.x; i < T * 32; i += NT)
                 s_res[i] = xr_sum(s_res[i], peer, i);
             __syncthreads();
@@ -1273,8 +1298,8 @@ __device__ __noinline__ void resid32(const Mat W, const QBuf in, float * x, bool
             for (int i = 0; i < n_items; i++) {
                 const int j = blockIdx.x + i * gridDim.x;
                 const float * pk = park + i * T * 32;
-                const __nv_bfloat16 * peer = cB.xr[k & 1] + j * MAXR * 32;
-                xr_wait(j, k);
+                const __nv_bfloat16 * peer = xr_slot(cB.xr[k & 1], j);
+                xr_wait(j, k, T * 32);
                 if (warp < T) {
                     const int t = warp, row = 32 * j + lane;
                     float xv = xr_sum(pk[t * 32 + lane], peer, t * 32 + lane);
@@ -3672,7 +3697,7 @@ struct MKEngine::Impl {
 #if MK_TP > 1
         // flags are zeroed once here and never per launch: tags carry the launch generation
         hb.rank = rank;
-        for (auto & b : hb.xr) b = dalloc<__nv_bfloat16>((size_t) D * MAXR);
+        for (auto & b : hb.xr) b = dalloc<__nv_bfloat16>((size_t) D / 32 * XR_SLOT);
         hb.fl = dalloc<unsigned>(D / 32);
         hb.lx = dalloc<float2>((size_t) MAXR * TOPK_MAX);
         hb.lfl = dalloc<unsigned>(1);

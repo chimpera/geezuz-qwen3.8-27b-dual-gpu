@@ -93,8 +93,8 @@ __device__ __noinline__ void resid32_ks(const Mat W, const QBuf in, float * x, b
     for (int i = 0; i < n_items; i++) {
         const int j = blockIdx.x + i * gridDim.x;
         const float * pk = park + i * T * 32;
-        const __nv_bfloat16 * peer = cB.xr[k & 1] + j * MAXR * 32;
-        xr_wait(j, k);
+        const __nv_bfloat16 * peer = xr_slot(cB.xr[k & 1], j);
+        xr_wait(j, k, nr * 32);
         for (int t = warp; t < T; t += NW) {
             const int row = 32 * j + lane;
             float xv = t < nr ? xr_sum(pk[t * 32 + lane], peer, t * 32 + lane) : pk[t * 32 + lane];
