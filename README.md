@@ -4,8 +4,8 @@
 
 | two RTX 3090s, coding prompt, greedy | Q4_K_M | Q8_0 |
 |---|---|---|
-| 1 request | **186 tok/s** | 141 tok/s |
-| 8 parallel requests (total) | **624 tok/s** | 595 tok/s |
+| 1 request | **190 tok/s** | 144 tok/s |
+| 8 parallel requests (total) | **625 tok/s** | 610 tok/s |
 
 - 1.64x llama.cpp's fastest two-GPU setup, same output quality ([Results](#results), [Quality](#quality)).
 - Up to 8 requests decoded together in one cycle ([Parallel requests](#parallel-requests)).
@@ -115,14 +115,14 @@ CLI `--slots N`: N variants of one coding prompt, 512 tokens each, `-d 4`, fp16 
 
 | parallel requests | Q4_K_M total tok/s | Q4_K_M ms per cycle | Q8_0 total tok/s | Q8_0 ms per cycle |
 |---|---|---|---|---|
-| 1 | 186 | 20.1 | 141 | 25.4 |
-| 2 | 262 | 27.9 | 230 | 30.9 |
-| 3 | 360 | 30.2 | 324 | 32.9 |
-| 4 | 428 | 31.2 | 396 | 33.7 |
-| 5 | 468 | 38.7 | 474 | 39.0 |
-| 6 | 514 | 42.6 | 505 | 43.1 |
-| 7 | 568 | 44.1 | 554 | 44.9 |
-| 8 | 624 | 43.7 | 595 | 44.7 |
+| 1 | 190 | 19.6 | 144 | 24.9 |
+| 2 | 266 | 27.3 | 233 | 30.3 |
+| 3 | 370 | 29.4 | 332 | 32.3 |
+| 4 | 442 | 30.2 | 407 | 33.2 |
+| 5 | 484 | 37.5 | 482 | 38.4 |
+| 6 | 526 | 41.1 | 515 | 42.2 |
+| 7 | 574 | 43.0 | 556 | 44.4 |
+| 8 | 625 | 42.7 | 610 | 43.8 |
 
 Total tok/s is the sum over all requests; at 8 requests each runs at about 75 to 78 tok/s. A cycle serves every request at once, so ms per cycle is also the gap between two token bursts of one stream. `bench/batch_bench.py` runs the same sweep through the server at 10K and 60K context (`--slots 1,2,3,4,6,8 --ctx 10000,60000`; `--engine llama` for llama-server `--parallel N`).
 
@@ -330,11 +330,11 @@ llama-quantize Qwen3.8-27B-BF16-00001-of-00002.gguf Qwen3.8-27B-Q4_K_M.gguf Q4_K
 
 ## FAQ
 
-**One instance on two cards, or two one-GPU instances?** One instance on two cards gives one request up to 186 tok/s and twice the KV memory, and serves up to 8 requests at once with `--slots`.
+**One instance on two cards, or two one-GPU instances?** One instance on two cards gives one request up to 190 tok/s and twice the KV memory, and serves up to 8 requests at once with `--slots`.
 
 **More than two GPUs?** No, the split is written for exactly two.
 
-**Parallel requests?** Yes, up to 8 on two GPUs: 624 tok/s in total on Q4_K_M. A task split into 8 independent parts finishes about 3.4x faster than as one request. Each slot needs its own KV memory, so long contexts limit the slot count.
+**Parallel requests?** Yes, up to 8 on two GPUs: 625 tok/s in total on Q4_K_M. A task split into 8 independent parts finishes about 3.4x faster than as one request. Each slot needs its own KV memory, so long contexts limit the slot count.
 
 **Which quants?** Q4_K_M (unsloth) is tuned, benchmarked and checked for quality; batched decode is also tuned on Q8_0. Q5_K_M, Q6_K and UD-Q4_K_M load but are not tuned or checked. Q8_0 (28.7 GB) only fits on two cards.
 
