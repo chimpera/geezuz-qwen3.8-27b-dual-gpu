@@ -494,20 +494,25 @@ struct MChain {
     int n;
 };
 
-// The chain over the RMS-normed rows of cB.qn (K = D) in K slices.  A warp's items run in rounds that are
-// uniform across the block (every warp takes part in each slice fill); consecutive rounds walk the slices
-// in opposite order, so they share the fill at the turn.
+// The chain over the RMS-normed rows of cB.qn (K = D) in K slices.  A projection has fewer 16-row tiles than
+// the grid has warps, so the two warps of a pair (same block) split each slice's K groups and reduce through
+// shared memory.  Rounds are uniform across the block (every warp takes part in each slice fill and reduce);
+// consecutive rounds walk the slices in opposite order.
 template <int TR, int TYPE>
 __device__ __noinline__ void gemv_mma(const MChain c) {
-    constexpr int NS = mma_ns<TR, D>(), KS = D / NS, NC = TR / 8;
-    const int lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
+    constexpr int NS = mma_ns<TR, D>(), KS = D / NS, NC = TR / 8, QH = KS / 64 / 2;
+    static_assert(NW % 2 == 0 && NW / 2 * NC * 4 * 32 * 4 <= SM_MISC, "pair partials fit below misc");
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, tig = lane & 3, h = warp & 1;
     float * s_rs = misc(smem);
-    const int W = nwarps(), lo = c.s[0].lo, hi = c.s[c.n - 1].hi;
-    const int first = lo + (((gwarp() - lo) % W) + W) % W, rounds = (hi - lo + W - 1) / W;
+    float * red = reinterpret_cast<float *>(smem) + (warp >> 1) * NC * 4 * 32;
+    const int P = nwarps() / 2, lo = c.s[0].lo, hi = c.s[c.n - 1].hi;
+    // tiles start lo / 2 pairs in, past the pairs whose warps ran the phase's leading items (gwarp() < lo)
+    const int base = lo - lo / 2, p = (warp >> 1) * gridDim.x + blockIdx.x, rounds = (hi - base + P - 1) / P;
     XC xc{};
     int cur = -1; // slice in shared memory
     for (int r = 0; r < rounds; r++) {
-        const int it = first + r * W;
+        const int it = base + p + r * P;
+        const bool on = it >= lo && it < hi;
         int k = 0;
         while (k + 1 < c.n && it >= c.s[k].hi) k++;
         const MSeg & sg = c.s[k];
@@ -519,20 +524,30 @@ __device__ __noinline__ void gemv_mma(const MChain c) {
             if (s != cur) {
                 xc = fill_xc<TR, KS>(cB.qn, 0, s * KS / 32, true, s_rs);
                 cur = s;
+                if (i == 1) mark_step(PS_WRITTEN); // step record: second slice in (every warp done with the first)
             }
-            if (it < hi) {
-                mma_tile<4, TR, TYPE>(sg.m, r0 + g, r0 + g + 8, s * KS, xc, 0, KS / 64, acc);
-            }
+            if (on) mma_tile<4, TR, TYPE>(sg.m, r0 + g, r0 + g + 8, s * KS, xc, h * QH, (h + 1) * QH, acc);
+            if (i == 0) mark_step(PS_RED); // step record: warp 0 done with the first slice
         }
-        if (it >= hi) continue;
+        __syncthreads(); // the slice is dead: the pair partials go in its place
+        mark_step(PS_SENT); // step record: every warp done multiplying
+        if (on && h)
+#pragma unroll
+            for (int nt = 0; nt < NC; nt++)
+#pragma unroll
+                for (int i = 0; i < 4; i++) red[(nt * 4 + i) * 32 + lane] = acc[0][nt][i];
+        __syncthreads();
+        cur = -1;
+        if (!on || h) continue;
 #pragma unroll
         for (int nt = 0; nt < NC; nt++)
 #pragma unroll
             for (int i = 0; i < 4; i++) {
                 const int t = 8 * nt + 2 * tig + (i & 1);
-                sg.base[t * sg.stride + r0 + g + 8 * (i >> 1)] = acc[0][nt][i] * s_rs[t];
+                sg.base[t * sg.stride + r0 + g + 8 * (i >> 1)] = (acc[0][nt][i] + red[(nt * 4 + i) * 32 + lane]) * s_rs[t];
             }
     }
+    __syncthreads(); // the partials are read until here; the caller's next shared-memory user may follow at once
     mark_step(PS_COMPUTE);
 }
 
@@ -578,12 +593,15 @@ __device__ __noinline__ void ffn_gu_mma(const LayerW & W) {
             if (s != cur) {
                 xc = fill_xc<TR, KS>(cB.qn, 0, s * KS / 32, true, s_rs);
                 cur = s;
+                if (i == 1) mark_step(PS_WRITTEN);
             }
             if (j < NI) {
                 mma_tile<4, TR, TYPE>(m, row, row + 8, s * KS, xc, 0, KS / 64, acc);
             }
+            if (i == 0) mark_step(PS_RED);
         }
         __syncthreads(); // every warp is done with the activations
+        mark_step(PS_SENT);
         cur = -1;
         if (j < NI) {
 #pragma unroll

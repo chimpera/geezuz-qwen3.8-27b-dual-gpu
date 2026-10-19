@@ -433,12 +433,12 @@ __device__ __forceinline__ void xr_send(int j, int k, float * part, int n) {
         dst[i] = *reinterpret_cast<const uint4 *>(h);
     }
 }
-// release the peer's flags of this block's n_items items after one system fence for all their sends
+// release the peer's flags of this block's n_items items; the release store orders the block's sends
+// (made visible to thread 0 by the barrier) without a sequentially consistent fence.sc.sys
 __device__ __forceinline__ void xr_release(int n_items, int k) {
     __syncthreads();
     mark_step(PS_WRITTEN);
     if (threadIdx.x == 0) {
-        __threadfence_system();
         for (int i = 0; i < n_items; i++) flag_release_sys(cB.peer_fl + blockIdx.x + i * gridDim.x, tag_of(k));
         mark_step(PS_SENT);
     }
@@ -447,7 +447,7 @@ __device__ __forceinline__ void xr_put(int j, int k, float * part, int n) {
     xr_send(j, k, part, n);
     __syncthreads();
     mark_step(PS_WRITTEN);
-    if (threadIdx.x == 0) { __threadfence_system(); flag_release_sys(cB.peer_fl + j, tag_of(k)); }
+    if (threadIdx.x == 0) flag_release_sys(cB.peer_fl + j, tag_of(k));
     mark_step(PS_SENT);
 }
 // own partial (rounded by xr_send) plus the peer's
@@ -474,7 +474,7 @@ __device__ __forceinline__ void lx_put(int k, const float2 * part, int n) {
     float2 * dst = cB.peer_lx;
     for (int i = threadIdx.x; i < n; i += NT) dst[i] = part[i];
     __syncthreads();
-    if (threadIdx.x == 0) { __threadfence_system(); flag_release_sys(cB.peer_lfl, tag_of(k)); }
+    if (threadIdx.x == 0) flag_release_sys(cB.peer_lfl, tag_of(k));
     mark_step(PS_SENT);
 }
 __device__ __forceinline__ void lx_wait(int k) {
