@@ -2,7 +2,7 @@
 
 **Geezuz, it's fast.** Qwen3.8-27B on two GPUs in one CUDA megakernel.
 
-| two RTX 3090s, coding prompt, greedy | Q4_K_M | Q8_0 |
+| two RTX 3090s power-limited to 280 W (stock 350 W), coding prompt, greedy | Q4_K_M | Q8_0 |
 |---|---|---|
 | 1 request | **190 tok/s** | 144 tok/s |
 | 8 parallel requests (total) | **625 tok/s** | 610 tok/s |
@@ -218,7 +218,7 @@ Two-GPU tuning, each step measured with `MK_PROFILE=1`:
 
 ### Batched decode
 
-`--slots N` (up to 8, server and CLI) gives each request its own slot: KV cache, DeltaNet state, MTP state, position and prompt cache. On two GPUs all active slots share one cycle:
+`--slots N` (up to 8, server and CLI) gives each request its own slot: DeltaNet state, MTP state and position; its KV comes from the shared pool (below). On two GPUs all active slots share one cycle:
 
 - **One weight read for all**: each slot checks its own drafts (1 to 5 rows); the rows of all slots are packed into one batch of up to 32, so each weight is read once per cycle. Up to 4 slots a cycle takes 16 rows, from 5 slots 32 (a wider cycle costs more than it returns at few slots).
 - **Tensor cores**: past 10 rows the dp4a path runs out of registers, so 16-, 24- and 32-row cycles use int8 tensor-core MMAs straight from Q8_0, Q4_K, Q5_K and Q6_K blocks, with one code path per weight type (`mma.cuh`; Q8_0 rows in 16-row tiles, `q8_tile.h`).
@@ -226,6 +226,14 @@ Two-GPU tuning, each step measured with `MK_PROFILE=1`:
 - **Smaller exchange**: partial sums cross PCIe as int8 with a scale per 32 values (bf16 with `MK_OPT=0`), and only rows in use are sent.
 
 The one-GPU library accepts `--slots` too, but decodes the slots one after another.
+
+### Shared KV pool and prefix cache
+
+- **One pool for all requests**: KV lives in blocks of 64 tokens (128 with q8_0 KV) that requests take as they grow, so one request can use up to `-c` while the others are short. Default `--kv-mem` takes the memory the fixed per-slot split used to take: Q8_0 with fp16 KV and 8 slots holds 208,704 tokens in total, and one 117K-token request runs next to four 10K ones.
+- **Prefix cache**: finished conversations stay in the pool as a radix tree of blocks plus DeltaNet state snapshots (at the end of the system prompt, the start of the last user message, the start of the generation prompt and the end of the prompt). A request that shares a prefix with anything cached prefills only the rest (`usage.prompt_tokens_details.cached_tokens`). Snapshots take at most a quarter of the pool; cached blocks are evicted least recently used first.
+- **Preemption**: requests are admitted when their prompt fits. When the pool runs full, cached blocks go first, then the most recently admitted request is paused (its tokens stay cached) and resumes when room frees up; its stream just pauses. A request that alone outgrows the pool ends with `finish_reason` `length`.
+- **Cost**: 0.1 to 0.6 % decode tok/s against the fixed split, quality unchanged (same KL divergence).
+- Greedy output after a pause or in a different batch is a valid continuation but not always token-identical: the draft/verify path takes a slightly different numeric route.
 
 ### The megakernel
 
@@ -265,17 +273,19 @@ Prompts go through ordinary kernel launches (`prefill.cuh`) in chunks of up to 2
 |---|---|---|
 | `-m` | | GGUF file |
 | `--host`, `--port` | 127.0.0.1, 18080 | |
-| `-c` | 32768 | context per slot |
+| `-c` | 32768 | maximum context of one request |
 | `-d` | 4 | drafts per cycle |
 | `--draft-vocab` | | draft vocabulary file |
 | `--lib` | `libgeezuz.so` | engine library |
-| `--kv` | auto | KV cache: `f16`, `q8`, or `auto` (fp16 unless it does not fit) |
+| `--kv` | auto | KV cache: `f16`, `q8`, or `auto` (q8_0 only when the fp16 pool holds less than one `-c` request) |
+| `--kv-mem` | 0 | KV pool MB per card (0: the free memory after the slots and a reserve) |
 | `--slots` | 1 | requests decoded at once; more requests queue |
+| `--think-budget` | 0 | reasoning tokens per request before `</think>` is forced (0: unlimited; a request's `thinking_budget` overrides it) |
 
 - Prompts use the chat template stored in the GGUF: `chat_template_kwargs` `enable_thinking` / `preserve_thinking` / `reasoning_effort`, OpenAI `tools`. Reasoning streams as `reasoning_content`; tool calls come back as `tool_calls`.
-- Follow-up requests of a conversation only prefill what is new. A request goes to the slot whose cached conversation shares the longest prefix, else to a free or least recently used slot. If the re-rendered history differs only after the previous prompt (e.g. a reformatted tool call), the engine rewinds to a checkpoint; anything else starts over.
+- Follow-up requests of a conversation, and requests sharing a system prompt, only prefill what is not in the prefix cache.
 - Sampling: temperature, top_p, top_k (<= 32), min_p, seed. Presence / repetition penalties are ignored (with a warning).
-- `GET /status` reports each slot; `/props` reports `total_slots`.
+- `GET /status` reports each slot (with its preemption count), `kv_pool` (free, total, cached and evictable blocks, tokens per block) and `preempted`; `/props` reports `total_slots`.
 
 open-jet uses this server in place of `llama-server` (`openjet setup` builds the one-GPU engine).
 
@@ -286,8 +296,9 @@ CLI (`geezuz`, `geezuz_tp2`):
 | flag | |
 |---|---|
 | `-d N` | drafts per cycle, 0-4 (with 4, a rejected draft drops the next cycle to 3) |
-| `-c N` | KV capacity in tokens |
+| `-c N` | maximum context of one request |
 | `--kv f16\|q8\|auto` | KV cache format |
+| `--kv-mem MB` | KV pool per card (default: the free memory after the slots and a reserve) |
 | `--slots N` | N prompt variants decoded together, each compared with its own solo run |
 | `--think [xhigh\|medium\|low]` | reasoning mode (template default: xhigh) |
 | `--temp`, `--top-p`, `--top-k`, `--min-p`, `--seed` | sampling (default greedy) |
@@ -309,6 +320,7 @@ Environment:
 | `MK_PROFILE=1` | per-phase timing, with a "min-composed" estimate that filters out other GPU users |
 | `MK_PROFILE=batch` | also block arrival per phase and a per-step record of block 0 (activation loads, compute, exchange, peer wait) |
 | `MK_PF_PROFILE=1` | per-kernel prefill timing |
+| `MK_HOST_PROF=1` | host time per decode cycle at exit: KV block bookkeeping, row prep + launch, wait for the cards, rest |
 | `MK_OPT=n` | batched-cycle switches, default 4: bit 1 one type-switching GEMV, bit 2 no next-phase L2 prefetch, bit 4 int8 exchange (else bf16) |
 | `MK_BATCH_ROWS=n` | fixed row cap per batched cycle (default 16 up to 4 slots, 32 above) |
 
@@ -334,7 +346,7 @@ llama-quantize Qwen3.8-27B-BF16-00001-of-00002.gguf Qwen3.8-27B-Q4_K_M.gguf Q4_K
 
 **More than two GPUs?** No, the split is written for exactly two.
 
-**Parallel requests?** Yes, up to 8 on two GPUs: 625 tok/s in total on Q4_K_M. A task split into 8 independent parts finishes about 3.4x faster than as one request. Each slot needs its own KV memory, so long contexts limit the slot count.
+**Parallel requests?** Yes, up to 8 on two GPUs: 625 tok/s in total on Q4_K_M. A task split into 8 independent parts finishes about 3.4x faster than as one request. All slots share one KV pool, so a long request and several short ones fit together; when the pool runs full, the newest request pauses until room frees up.
 
 **Which quants?** Q4_K_M (unsloth) is tuned, benchmarked and checked for quality; batched decode is also tuned on Q8_0. Q5_K_M, Q6_K and UD-Q4_K_M load but are not tuned or checked. Q8_0 (28.7 GB) only fits on two cards.
 
@@ -356,7 +368,7 @@ llama-quantize Qwen3.8-27B-BF16-00001-of-00002.gguf Qwen3.8-27B-Q4_K_M.gguf Q4_K
 - Tuned and measured on RTX 3090s (sm_86); builds for sm_89 and sm_120.
 - At most two identical GPUs, with PCIe P2P. Batched decode: up to 8 slots, two-GPU build only.
 - Sampling: temperature, top-k (<= 32), top-p, min-p (llama.cpp's order); no presence / repetition penalties.
-- Text only. Per slot one conversation and one checkpoint: editing an earlier part (e.g. context compaction) re-prefills it. No slot save / restore.
+- Text only. The prefix cache resumes at its snapshots: editing an earlier part (e.g. context compaction) re-prefills from the last snapshot before the edit. No cache save / restore across restarts.
 
 ## Files
 
@@ -364,6 +376,9 @@ llama-quantize Qwen3.8-27B-BF16-00001-of-00002.gguf Qwen3.8-27B-Q4_K_M.gguf Q4_K
 |---|---|
 | `qwen38_mk.cu` / `qwen38_mk.h` | loader, repacking, the megakernel (one and two GPUs), the `MKEngine` API |
 | `batch.cuh` / `mma.cuh` / `q8_tile.h` | batched decode cycle, its tensor-core GEMVs, the Q8_0 tile layout |
+| `kv_cache.h` | KV block pool: refcounts, copy-on-write, radix-tree prefix cache, DeltaNet snapshots, LRU eviction |
+| `tests/kv_cache_fuzz.cpp`, `tests/kv_cache_scen.cpp` | pool fuzz and scenario tests against a content-checking fake device (`g++ -std=c++17 -O2 -I.. <file>`) |
+| `tests/sched_sim.py`, `tests/sched_sim_identity.py` | server scheduler simulation (admission, preemption, thinking budget) on a fake engine |
 | `prefill.cuh` / `prefill_gemm.cuh` | prefill kernels and their fp16 GEMM |
 | `capi.cpp` | C API (engine + libllama tokenizer) for `libgeezuz.so` / `libgeezuz_tp2.so` |
 | `server/mk_server.py` | OpenAI-compatible server |
@@ -371,7 +386,8 @@ llama-quantize Qwen3.8-27B-BF16-00001-of-00002.gguf Qwen3.8-27B-Q4_K_M.gguf Q4_K
 | `gguf.h` | minimal mmap GGUF reader |
 | `draft_vocab_32k.bin`, `tools/vocab_freq.cpp` | MTP draft vocabulary (int32 ids) and its builder |
 | `tools/llama_ref.cpp` / `logit_stats.h` | llama.cpp reference distributions and the comparison with them |
-| `bench/tp2_bench.py`, `bench/batch_bench.py` | two-GPU benchmark vs llama-server; parallel-request sweep |
+| `bench/tp2_bench.py`, `bench/batch_bench.py` | two-GPU benchmark vs llama-server; parallel-request sweep (Geezuz, llama.cpp, vLLM) |
+| `bench/quality_bench.py`, `bench/gsm8k_test.jsonl` | GSM8K accuracy through each engine's server (test set from openai/grade-school-math) |
 | `bench/code_bench.py`, `bench/think_bench.py`, `bench/bench.py` | one-GPU benchmarks |
 | `bench/*_bench.cu` | GEMV / GEMM microbenchmarks |
 | `docker/build.Dockerfile`, `scripts/box-*.sh` | containerized build on a remote GPU host |
@@ -380,4 +396,4 @@ llama-quantize Qwen3.8-27B-BF16-00001-of-00002.gguf Qwen3.8-27B-Q4_K_M.gguf Q4_K
 
 The megakernel is the work of **L-Forster** in [open-jet](https://github.com/L-Forster/open-jet): the decode megakernel, the prefill kernels, the loader, the server and CLI, the one-GPU benchmarks (`bench/code_bench.py`, `bench/think_bench.py`, `bench/bench.py`, `bench/{ffn,gemv,mmq,resid}_bench.cu`), the quality tooling (`tools/llama_ref`, `logit_stats.h`, `--kld`) and the draft vocabulary. This repository is a modified version of `megakernel/` at commit `2993f47`, imported with its git history, licensed under the GNU Affero General Public License v3.0 and distributed under the same license (see `LICENSE`).
 
-Modifications, October 2026: sources moved to the repository root; per-tensor Q4_K / Q5_K / Q6_K / Q8_0 weights in decode and prefill; tensor parallelism over two GPUs via PCIe P2P (decode and prefill) with the two-GPU tuning; batched decode of up to 8 slots (tensor-core GEMVs, int8 exchange, server scheduler); `bench/tp2_bench.py`, `bench/batch_bench.py`, `bench/kq_mma_bench.cu`, `bench/q6_dp4a_bench.cu`; the benchmarks and quality checks above.
+Modifications, October 2026: sources moved to the repository root; per-tensor Q4_K / Q5_K / Q6_K / Q8_0 weights in decode and prefill; tensor parallelism over two GPUs via PCIe P2P (decode and prefill) with the two-GPU tuning; batched decode of up to 8 slots (tensor-core GEMVs, int8 exchange, server scheduler); shared paged KV pool with prefix cache and preemption (`kv_cache.h`, `tests/`); `bench/tp2_bench.py`, `bench/batch_bench.py`, `bench/quality_bench.py`, `bench/kq_mma_bench.cu`, `bench/q6_dp4a_bench.cu`; the benchmarks and quality checks above.

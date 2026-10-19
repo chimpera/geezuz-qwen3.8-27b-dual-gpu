@@ -21,7 +21,8 @@ static void usage() {
             "                 [--prompt-ids f]   (prompt given as whitespace-separated token ids)\n"
             "                 [--think [xhigh|medium|low]]   (reasoning mode, the chat template's default effort is xhigh)\n"
             "                 [--temp t] [--top-p p] [--top-k k] [--min-p p] [--seed s]   (default: greedy)\n"
-            "                 [--kv f16|q8|auto]   (KV cache format; auto: q8_0 only when fp16 does not fit)\n"
+            "                 [--kv f16|q8|auto]   (KV cache format; auto: q8_0 only when the fp16 pool holds less than one -c sequence)\n"
+            "                 [--kv-mem MB]   (KV pool per card; default 0: the free memory after the lanes and a reserve)\n"
             "                 [--slots N]   (N sequence slots: N prompt variants decoded together in batched cycles, each\n"
             "                     checked against a solo run of its own)\n"
             "                 [--kld ref [--ref-out f] [--score-path prefill|decode|mixed]]   (KL divergence, perplexity and\n"
@@ -46,6 +47,7 @@ int main(int argc, char ** argv) {
     int top_k = 32;
     unsigned long long seed = 1;
     int kv_mode = -1;
+    int kv_mem = 0;
     int slots = 1;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -75,6 +77,7 @@ int main(int argc, char ** argv) {
         else if (a == "--seed") seed = strtoull(next().c_str(), nullptr, 10);
         else if (a == "--kv") { const std::string k = next(); kv_mode = k == "f16" ? 0 : k == "q8" ? 1 : -1; }
         else if (a == "--slots") slots = atoi(next().c_str());
+        else if (a == "--kv-mem") kv_mem = atoi(next().c_str());
         else if (a == "--turn2-file") { std::ifstream f(next()); std::stringstream ss; ss << f.rdbuf(); turn2 = ss.str(); }
         else usage();
     }
@@ -118,7 +121,7 @@ int main(int argc, char ** argv) {
         ls::Session ses(kld_file, ref_out, {}, MKEngine::n_vocab());
         size_t longest = 0;
         for (const ls::Seq & q : ses.seqs()) longest = std::max(longest, q.tok.size());
-        MKEngine eng(model, std::max(ctx, (int) longest + 64), 0, "", kv_mode);
+        MKEngine eng(model, std::max(ctx, (int) longest + 64), 0, "", kv_mode, 1, kv_mem);
         for (size_t s = 0; s < ses.seqs().size(); s++) {
             const ls::Seq & q = ses.seqs()[s];
             const int N = (int) q.tok.size();
@@ -131,7 +134,7 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
-    MKEngine eng(model, ctx, n_draft, draft_vocab, kv_mode, slots);
+    MKEngine eng(model, ctx, n_draft, draft_vocab, kv_mode, slots, kv_mem);
     eng.set_sampling(temp, top_p, top_k, min_p, seed);
     if (bench_phases) {
         eng.bench_phases();
@@ -214,21 +217,23 @@ int main(int argc, char ** argv) {
     if (slots > 1) {
         // decode n_predict tokens per slot, all unfinished slots in one batched cycle
         std::vector<std::vector<int>> pr(slots), got(slots);
+        std::vector<int> ids(slots);
         for (int s = 0; s < slots; s++) {
             pr[s] = tokenize(sys + "<|im_start|>user\n" + prompt + " (variant " + std::to_string(s) + ")<|im_end|>\n" + gen_prompt);
-            eng.select(s);
+            int reused = 0;
+            ids[s] = eng.seq_open({}, reused);
             eng.set_sampling(temp, top_p, top_k, min_p, seed);
             got[s] = {eng.prefill(pr[s])};
         }
         const MKStats s0 = eng.stats;
         auto t0 = std::chrono::steady_clock::now();
         for (;;) {
-            std::vector<int> act;
+            std::vector<int> act, act_ids;
             for (int s = 0; s < slots; s++)
-                if ((int) got[s].size() < n_predict) act.push_back(s);
+                if ((int) got[s].size() < n_predict) act.push_back(s), act_ids.push_back(ids[s]);
             if (act.empty()) break;
             std::vector<std::vector<int>> o;
-            eng.step_batch(act, o);
+            eng.step_batch(act_ids, o);
             for (size_t i = 0; i < act.size(); i++) got[act[i]].insert(got[act[i]].end(), o[i].begin(), o[i].end());
         }
         const double dc = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -248,7 +253,7 @@ int main(int argc, char ** argv) {
                 slots, n_dec, dc, n_dec / dc, eng.stats.cycles - s0.cycles, ac, dr, dr ? 100.0 * ac / dr : 0.0);
         int bad = 0;
         for (int s = 0; s < slots; s++) {
-            eng.select(s);
+            eng.select(ids[s]);
             eng.reset();
             std::vector<int> solo = {eng.prefill(pr[s])};
             while ((int) solo.size() < n_predict) eng.step(solo);

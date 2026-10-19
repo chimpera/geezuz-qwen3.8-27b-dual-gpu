@@ -14,7 +14,7 @@ DIST = geezuz-$(VERSION)-$(ARCH)
 all: geezuz libgeezuz.so geezuz_tp2 libgeezuz_tp2.so tools/vocab_freq tools/llama_ref
 
 # ptxas register / spill report for every phase function goes to ptxas.log
-qwen38_mk.o: qwen38_mk.cu qwen38_mk.h gguf.h prefill.cuh prefill_gemm.cuh batch.cuh mma.cuh q8_tile.h
+qwen38_mk.o: qwen38_mk.cu qwen38_mk.h kv_cache.h gguf.h prefill.cuh prefill_gemm.cuh batch.cuh mma.cuh q8_tile.h
 	$(NVCC) $(NVFLAGS) -I$(LLAMA)/ggml/include -c qwen38_mk.cu -o $@ 2> ptxas.log || (cat ptxas.log; false)
 
 geezuz: qwen38_mk.o main.cu logit_stats.h
@@ -27,7 +27,7 @@ libgeezuz.so: qwen38_mk.o capi.cpp qwen38_mk.h
 		$(LDLLAMA) -o $@
 
 # TP=2 variant: same compile with MK_TP=2, its own ptxas report
-qwen38_mk_tp2.o: qwen38_mk.cu qwen38_mk.h gguf.h prefill.cuh prefill_gemm.cuh batch.cuh mma.cuh q8_tile.h
+qwen38_mk_tp2.o: qwen38_mk.cu qwen38_mk.h kv_cache.h gguf.h prefill.cuh prefill_gemm.cuh batch.cuh mma.cuh q8_tile.h
 	$(NVCC) $(NVFLAGS) -DMK_TP=2 -I$(LLAMA)/ggml/include -c qwen38_mk.cu -o $@ 2> ptxas_tp2.log || (cat ptxas_tp2.log; false)
 
 geezuz_tp2: qwen38_mk_tp2.o main.cu logit_stats.h

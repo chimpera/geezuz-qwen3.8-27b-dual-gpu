@@ -7,16 +7,25 @@ llama-server's API that open-jet uses).
 POST /v1/chat/completions (streaming or not): the request is rendered with the chat template stored
 in the GGUF (enable_thinking / preserve_thinking / reasoning_effort via chat_template_kwargs, tools
 via `tools`), reasoning is returned as `reasoning_content`, Qwen's XML tool calls as structured
-`tool_calls`.  Sampling: temperature, top_p, top_k (<= 32), min_p, seed.  Successive requests of a
-conversation reuse the processed tokens: the new prompt is matched against the sequence so far and
-only the rest is prefilled (rewinding to the end of the previous prompt if it diverges after that).
-GET /health, GET /v1/models.  --slots N decodes up to N requests at once (each in its own sequence slot,
-picked by the longest cached prefix); more wait for a free slot.  A prompt is prefilled between decode cycles, in chunks while others decode.
+`tool_calls`.  Sampling: temperature, top_p, top_k (<= 32), min_p, seed.  Requests reuse processed prompt
+prefixes across requests and conversations (the engine's prefix cache in the KV pool): a request starts from
+the longest cached prefix with a stored DeltaNet state (a finished request's end, the state before a prompt's
+last token, the end of a leading system message and the start of the last user message) and only the rest is
+prefilled; usage.prompt_tokens_details.cached_tokens reports the reused tokens.
+GET /health, GET /v1/models.  --slots N decodes up to N requests at once; more wait for a free slot.  A prompt is
+prefilled between decode cycles, in chunks while others decode.  The requests share one KV pool (--kv-mem) with the
+prefix cache: a request is admitted when the free blocks plus the cached ones the engine can evict (least
+recently used first) cover its prompt and a little growth.  When the pool runs full anyway, the most recently
+admitted request is preempted: its sequence stays cached, it waits at the head of the queue and resumes by
+prefilling its prompt plus what it generated (mostly cached), its stream continuing seamlessly; a request running
+alone that cannot grow ends with finish_reason "length".
 GET /status: what the engine is doing now (phase, live token count, tail of the reasoning / text / tool call
-being generated, per slot under `slots`) and the stats of the last finished request.
+being generated, per slot under `slots`), the KV pool (`kv_pool`), preemptions (`preempted`, per slot `preempts`)
+and the stats of the last finished request.
 """
 import argparse
 import codecs
+import collections
 import ctypes
 import json
 import os
@@ -36,7 +45,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Forced into the reasoning when the thinking budget runs out, so the model answers instead of hitting max_tokens.
 THINK_STOP = "\n\nI have thought enough and will answer now based on the reasoning so far.\n</think>\n\n"
 TOPK_MAX = 32
-REUSE_MIN = 128  # cached prefix (tokens) worth steering a request to a slot; shorter ones re-prefill in a blink
 STATUS_TAIL = 400  # characters of reasoning / text / tool call (or of a tool argument) GET /status shows
 
 
@@ -44,45 +52,52 @@ def log(*a):
     print("[mk-server]", *a, file=sys.stderr, flush=True)
 
 
+MK_POOL_FULL = -2  # capi.cpp: too few free KV blocks; the call changed nothing
+
+
+class PoolFull(RuntimeError):
+    pass
+
+
 class Engine:
     """ctypes binding of capi.cpp"""
 
-    def __init__(self, lib, model, ctx, n_draft, draft_vocab, kv_mode=-1, n_seq=1):
+    def __init__(self, lib, model, ctx, n_draft, draft_vocab, kv_mode=-1, n_seq=1, kv_mem=0):
         L = self.L = ctypes.CDLL(lib)
         vp, ip, cp = ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p
         sig = {
-            "mk_new": (vp, [cp, ctypes.c_int, ctypes.c_int, cp, ctypes.c_int, ctypes.c_int]),
+            "mk_new": (vp, [cp, ctypes.c_int, ctypes.c_int, cp, ctypes.c_int, ctypes.c_int, ctypes.c_int]),
+            "mk_pool_stats": (None, [vp, ip, ip, ip, ip, ip]),
+            "mk_seq_open": (ctypes.c_int, [vp, ip, ctypes.c_int, ip]),
+            "mk_seq_close": (ctypes.c_int, [vp, ctypes.c_int, ctypes.c_int]),
+            "mk_seq_blocks": (ctypes.c_int, [vp, ctypes.c_int]),
+            "mk_kv_ahead": (ctypes.c_int, []),
             "mk_last_error": (cp, []),
             "mk_chat_template": (ctypes.c_int, [vp, cp, ctypes.c_int]),
             "mk_tokenize": (ctypes.c_int, [vp, cp, ctypes.c_int, ip, ctypes.c_int]),
             "mk_piece": (ctypes.c_int, [vp, ctypes.c_int, cp, ctypes.c_int]),
             "mk_is_eog": (ctypes.c_int, [vp, ctypes.c_int]),
-            "mk_set_sampling": (ctypes.c_int, [vp, ctypes.c_float, ctypes.c_float, ctypes.c_int, ctypes.c_float,
-                                               ctypes.c_ulonglong]),
-            "mk_prefill": (ctypes.c_int, [vp, ip, ctypes.c_int]),
-            "mk_append": (ctypes.c_int, [vp, ip, ctypes.c_int]),
-            "mk_step": (ctypes.c_int, [vp, ip, ctypes.c_int]),
-            "mk_select": (ctypes.c_int, [vp, ctypes.c_int]),
+            "mk_set_sampling": (ctypes.c_int, [vp, ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_int,
+                                               ctypes.c_float, ctypes.c_ulonglong]),
+            "mk_prefill": (ctypes.c_int, [vp, ctypes.c_int, ip, ctypes.c_int, ip, ctypes.c_int]),
+            "mk_append": (ctypes.c_int, [vp, ctypes.c_int, ip, ctypes.c_int, ip, ctypes.c_int]),
             "mk_step_batch": (ctypes.c_int, [vp, ip, ctypes.c_int, ip, ctypes.c_int, ip]),
-            "mk_reset": (None, [vp]),
-            "mk_truncate": (ctypes.c_int, [vp, ctypes.c_int]),
-            "mk_sequence": (ctypes.c_int, [vp, ip, ctypes.c_int]),
-            "mk_committed": (ctypes.c_int, [vp]),
-            "mk_checkpoint_pos": (ctypes.c_int, [vp]),
-            "mk_rewind_to_checkpoint": (ctypes.c_int, [vp]),
+            "mk_truncate": (ctypes.c_int, [vp, ctypes.c_int, ctypes.c_int]),
+            "mk_sequence": (ctypes.c_int, [vp, ctypes.c_int, ip, ctypes.c_int]),
         }
         for name, (res, args) in sig.items():
             f = getattr(L, name)
             f.restype, f.argtypes = res, args
         self.h = L.mk_new(model.encode(), ctx, n_draft, draft_vocab.encode() if draft_vocab else None, kv_mode,
-                          n_seq)
+                          n_seq, kv_mem)
         if not self.h:
             raise RuntimeError(L.mk_last_error().decode())
         self.ctx = ctx
         self._pieces = {}
 
-    def _err(self, what):
-        return RuntimeError(f"{what}: {self.L.mk_last_error().decode()}")
+    def _err(self, what, code=-1):
+        msg = f"{what}: {self.L.mk_last_error().decode()}"
+        return PoolFull(msg) if code == MK_POOL_FULL else RuntimeError(msg)
 
     def chat_template(self):
         n = self.L.mk_chat_template(self.h, None, 0)
@@ -112,64 +127,81 @@ class Engine:
     def is_eog(self, tok):
         return bool(self.L.mk_is_eog(self.h, tok))
 
-    def set_sampling(self, temp, top_p, top_k, min_p, seed):
-        if self.L.mk_set_sampling(self.h, temp, top_p, top_k, min_p, seed) < 0:
+    def seq_open(self, toks):
+        """opens a sequence from the longest cached prefix of toks with a stored state; returns (id, reused tokens)"""
+        reused = ctypes.c_int()
+        i = self.L.mk_seq_open(self.h, (ctypes.c_int * max(len(toks), 1))(*toks), len(toks), ctypes.byref(reused))
+        if i < 0:
+            raise self._err("seq_open")
+        return i, reused.value
+
+    def seq_close(self, i, keep=True):
+        """keep: the sequence's tokens and state stay cached for later requests"""
+        if self.L.mk_seq_close(self.h, i, int(keep)) < 0:
+            raise self._err("seq_close")
+
+    def seq_blocks(self, i):
+        n = self.L.mk_seq_blocks(self.h, i)
+        if n < 0:
+            raise self._err("seq_blocks")
+        return n
+
+    def set_sampling(self, i, temp, top_p, top_k, min_p, seed):
+        if self.L.mk_set_sampling(self.h, i, temp, top_p, top_k, min_p, seed) < 0:
             raise self._err("sampling")
 
-    def prefill(self, toks):
+    def _feed(self, f, what, i, toks, snaps):
         arr = (ctypes.c_int * len(toks))(*toks)
-        r = self.L.mk_prefill(self.h, arr, len(toks))
+        r = f(self.h, i, arr, len(toks), (ctypes.c_int * max(len(snaps), 1))(*snaps), len(snaps))
         if r < 0:
-            raise self._err("prefill")
+            raise self._err(what, r)
         return r
 
-    def append(self, toks):
-        arr = (ctypes.c_int * len(toks))(*toks)
-        r = self.L.mk_append(self.h, arr, len(toks))
-        if r < 0:
-            raise self._err("append")
-        return r
+    def prefill(self, i, toks, snaps=()):
+        """feeds toks to sequence i, caching the states at the sequence positions snaps and before the last token;
+        returns the next token"""
+        return self._feed(self.L.mk_prefill, "prefill", i, toks, snaps)
 
-    def step(self):
-        out = (ctypes.c_int * 8)()
-        n = self.L.mk_step(self.h, out, 8)
-        if n < 0:
-            raise self._err("decode")
-        return list(out[:n])
+    def append(self, i, toks, snaps=()):
+        """prefill() without the state before the last token (forced tokens, intermediate prompt chunks)"""
+        return self._feed(self.L.mk_append, "append", i, toks, snaps)
 
-    def select(self, s):
-        if self.L.mk_select(self.h, s) < 0:
-            raise self._err("select")
-
-    def step_batch(self, slots):
-        """one cycle of the given slots; returns each slot's tokens"""
-        n, cap = len(slots), 8
+    def step_batch(self, ids):
+        """one cycle of the given sequences; returns each one's tokens"""
+        n, cap = len(ids), 8
         out, counts = (ctypes.c_int * (n * cap))(), (ctypes.c_int * n)()
-        if self.L.mk_step_batch(self.h, (ctypes.c_int * n)(*slots), n, out, cap, counts) < 0:
-            raise self._err("decode")
+        r = self.L.mk_step_batch(self.h, (ctypes.c_int * n)(*ids), n, out, cap, counts)
+        if r < 0:
+            raise self._err("decode", r)
         return [list(out[b * cap:b * cap + counts[b]]) for b in range(n)]
 
-    def reset(self):
-        self.L.mk_reset(self.h)
+    def pool_stats(self):
+        v = [ctypes.c_int() for _ in range(5)]
+        self.L.mk_pool_stats(self.h, *(ctypes.byref(x) for x in v))
+        return dict(zip(("free_blocks", "total_blocks", "block_tokens", "cached_blocks", "evictable_blocks"),
+                        (x.value for x in v)))
 
-    def truncate(self, n):
-        if self.L.mk_truncate(self.h, n) < 0:
+    def kv_ahead(self):
+        return self.L.mk_kv_ahead()
+
+    def truncate(self, i, n):
+        if self.L.mk_truncate(self.h, i, n) < 0:
             raise self._err("truncate")
 
-    def sequence(self):
-        n = self.L.mk_sequence(self.h, None, 0)
+    def seq_len(self, i):
+        n = self.L.mk_sequence(self.h, i, None, 0)
+        if n < 0:
+            raise self._err("sequence")
+        return n
+
+    def sequence(self, i):
+        """sequence i's tokens: prompt(s) and emitted tokens"""
+        n = self.L.mk_sequence(self.h, i, None, 0)
+        if n < 0:
+            raise self._err("sequence")
         out = (ctypes.c_int * max(n, 1))()
-        self.L.mk_sequence(self.h, out, n)
+        self.L.mk_sequence(self.h, i, out, n)
         return list(out[:n])
-
-    def committed(self):
-        return self.L.mk_committed(self.h)
-
-    def checkpoint_pos(self):
-        return self.L.mk_checkpoint_pos(self.h)
-
-    def rewind_to_checkpoint(self):
-        return self.L.mk_rewind_to_checkpoint(self.h) == 0
 
 
 # ---------------------------------------------------------------------------------------------
@@ -327,8 +359,17 @@ class Job:
         self.n_gen, self.n_think, self.finish, self.reused = 0, 0, "length", 0
         self.events = queue.Queue()
         self.cancelled = False  # set by the handler when the client is gone
-        self.slot = None
-        self.fed = 0  # prompt tokens the slot holds
+        self.slot = None  # the /status seat it runs in
+        self.seq = None  # its engine sequence
+        self.snaps = []  # prompt positions (message starts) whose states the engine caches for later requests
+        self.feed = toks  # tokens to prefill on admission: the prompt, after a preemption also what it generated
+        self.fed = 0  # tokens of feed its sequence holds
+        self.stopped = False  # the think stop was forced into the sequence
+        self.admitted = 0  # admission order stamp (0: never admitted); the latest admitted job is preempted first
+        self.preempts = 0  # times it left for a full KV pool and resumed by recompute
+        self.held = 0  # KV blocks it held when last preempted (most stay cached: not room it can count on)
+        self.seed = None  # sampling seed, fixed at the first admission
+        self.decoding = False  # its first token is out (a resume continues the stream and the decode timing)
         self.t0 = self.t1 = time.time()
 
     def show(self, kind, delta):
@@ -353,15 +394,20 @@ class Server:
         self.args = args
         t0 = time.time()
         self.eng = Engine(args.lib, args.model, args.ctx, args.draft, args.draft_vocab,
-                          {"f16": 0, "q8": 1, "auto": -1}[args.kv], args.slots)
+                          {"f16": 0, "q8": 1, "auto": -1}[args.kv], args.slots, args.kv_mem)
         self.template = make_template(self.eng.chat_template())
         self.warm_up()
         self.model_id = os.path.basename(args.model)
         self.warned = set()
         self.queue = queue.Queue()
+        self.waiting = collections.deque()  # jobs not admitted yet for lack of a slot or KV blocks, in arrival order
+        self.pool = self.eng.pool_stats()  # refreshed by the scheduler thread; the engine is not read from handlers
+        self.kv_ahead = self.eng.kv_ahead()
+        self.im_start = self.eng.tokenize("<|im_start|>")
+        self.think_stop_n = len(self.eng.tokenize(THINK_STOP))
         self.active = {}  # slot -> Job, touched by the scheduler thread only
-        self.slot_seq = [[] for _ in range(args.slots)]  # each slot's sequence when its last job ended
-        self.slot_used = [0.0] * args.slots
+        self.admissions = 0
+        self.preempted = 0  # preemptions since start
         now = time.time()
         self.slot_status = [{"slot": s, "busy": False, "phase": "idle", "action": None, "updated": now}
                             for s in range(args.slots)]
@@ -381,14 +427,12 @@ class Server:
         buffers are allocated on first use; with several slots the cycle is a batched one."""
         toks = self.eng.tokenize("Hello, how are you today?")
         assert len(toks) >= 2
-        slots = list(range(min(self.args.slots, 2)))
-        for s in slots:
-            self.eng.select(s)
-            self.eng.prefill(toks)
-        self.eng.step_batch(slots)
-        for s in slots:
-            self.eng.select(s)
-            self.eng.reset()
+        ids = [self.eng.seq_open([])[0] for _ in range(min(self.args.slots, 2))]
+        for i in ids:
+            self.eng.append(i, toks)  # no state cached for later requests
+        self.eng.step_batch(ids)
+        for i in ids:
+            self.eng.seq_close(i, keep=False)
 
     def warn_once(self, key, msg):
         if key not in self.warned:
@@ -415,42 +459,50 @@ class Server:
         text, thinking = self.render(body)
         toks = self.eng.tokenize(text)
         max_new = int(body.get("max_tokens") or body.get("max_completion_tokens") or body.get("n_predict") or -1)
-        limit = self.args.ctx - len(toks) - 16
+        budget = body.get("thinking_budget", (body.get("chat_template_kwargs") or {}).get("thinking_budget",
+                                                                                         self.args.think_budget))
+        budget = int(budget or 0) if thinking else 0
+        # a forced think stop enters the sequence without counting as generated tokens
+        limit = self.args.ctx - len(toks) - 16 - (self.think_stop_n if budget else 0)
         if limit <= 0:
             raise BadRequest(f"prompt of {len(toks)} tokens does not fit the context of {self.args.ctx}")
         max_new = limit if max_new <= 0 else min(max_new, limit)
-        budget = body.get("thinking_budget", (body.get("chat_template_kwargs") or {}).get("thinking_budget",
-                                                                                         self.args.think_budget))
-        return Job(body, toks, thinking, max_new, int(budget or 0) if thinking else 0)
+        job = Job(body, toks, thinking, max_new, budget)
+        job.snaps = self.snap_hints(toks)
+        return job
+
+    def snap_hints(self, toks):
+        """prompt positions where a later request is likely to diverge: the end of a leading system message (with
+        the tools), the start of the last user message and the start of the generation prompt (a later turn may
+        render it differently, e.g. without <think>); the engine also caches the state before the last token"""
+        if len(self.im_start) != 1:
+            return []
+        starts = [i for i, t in enumerate(toks[:-1]) if t == self.im_start[0]]
+        role = lambda i: self.eng.piece(toks[i + 1])
+        hints = set()
+        if len(starts) > 1 and role(starts[0]) == b"system":
+            hints.add(starts[1])
+        users = [i for i in starts if role(i) == b"user"]
+        if users:
+            hints.add(users[-1])
+        if starts:
+            hints.add(starts[-1])
+        return sorted(h for h in hints if 0 < h < len(toks) - 1)
 
     def submit(self, job):
         self.queue.put(job)
 
-    def prompt_start(self, toks):
-        """brings the selected slot to a prefix of `toks` it already holds; returns that prefix's length"""
-        eng = self.eng
-        seq = eng.sequence()
-        lcp = common_prefix(seq, toks)
-        lcp = min(lcp, len(toks) - 1)  # at least one token is fed (it produces the next one)
-        log(f"reuse: cached {len(seq)}, prompt {len(toks)}, common prefix {lcp}, "
-            f"committed {eng.committed()}, checkpoint {eng.checkpoint_pos()}")
-        if seq and lcp >= eng.committed():
-            eng.truncate(lcp)
-            return lcp
-        ck = eng.checkpoint_pos()
-        if 0 < ck <= lcp and eng.rewind_to_checkpoint():
-            return ck
-        eng.reset()
-        return 0
-
-    def sampling(self, body):
-        """sets the selected slot's sampling from the request"""
+    def sampling(self, job):
+        """sets the job's sequence's sampling from the request"""
+        body = job.body
         temp = float(body.get("temperature", 0.8) if body.get("temperature") is not None else 0.8)
         top_p = float(body.get("top_p", 0.95) if body.get("top_p") is not None else 0.95)
         top_k = int(body.get("top_k", 40) if body.get("top_k") is not None else 40)
         min_p = float(body.get("min_p", 0.05) if body.get("min_p") is not None else 0.05)
-        seed = body.get("seed")
-        seed = random.getrandbits(63) if seed is None or int(seed) < 0 else int(seed)
+        if job.seed is None:  # drawn once: the sampler is keyed by (seed, position), so a resume continues the same draws
+            seed = body.get("seed")
+            job.seed = random.getrandbits(63) if seed is None or int(seed) < 0 else int(seed)
+        seed, i = job.seed, job.seq
         if top_k <= 0 or top_k > TOPK_MAX:
             self.warn_once("top_k", f"top_k {top_k} -> {TOPK_MAX} (the megakernel samples from at most {TOPK_MAX} candidates)")
             top_k = TOPK_MAX
@@ -460,9 +512,9 @@ class Server:
         if float(body.get("repetition_penalty") or body.get("repeat_penalty") or 1.0) != 1.0:
             self.warn_once("rep", "repetition_penalty is not supported by the megakernel and is ignored")
         if temp <= 0:
-            self.eng.set_sampling(0.0, 1.0, TOPK_MAX, 0.0, seed)
+            self.eng.set_sampling(i, 0.0, 1.0, TOPK_MAX, 0.0, seed)
         else:
-            self.eng.set_sampling(temp, top_p, top_k, min_p, seed)
+            self.eng.set_sampling(i, temp, top_p, top_k, min_p, seed)
 
     # ---- /status
 
@@ -475,7 +527,8 @@ class Server:
         slots = list(self.slot_status)
         busy = [st for st in slots if st["busy"]]
         top = max(busy or slots, key=lambda st: st["updated"])
-        return {**top, "busy": bool(busy), "last": self.last, "queued": self.queue.qsize(), "slots": slots}
+        return {**top, "busy": bool(busy), "last": self.last, "queued": self.queue.qsize() + len(self.waiting),
+                "kv_pool": self.pool, "preempted": self.preempted, "slots": slots}
 
     @staticmethod
     def rate(n_gen, elapsed):
@@ -497,105 +550,213 @@ class Server:
 
     def run(self):
         while True:
-            if not self.active:
-                self.admit(self.queue.get())
-            while len(self.active) < self.args.slots:
+            if not self.active and not self.waiting:
+                self.waiting.append(self.queue.get())
+            self.schedule()
+
+    def schedule(self):
+        """one scheduler pass: admissions, prompt feeding, one decode cycle"""
+        # in arrival order, while a slot is free and the KV pool covers the job's feed (alone it always fits)
+        while len(self.active) < self.args.slots:
+            if not self.waiting:
                 try:
-                    job = self.queue.get_nowait()
+                    self.waiting.append(self.queue.get_nowait())
                 except queue.Empty:
                     break
-                self.admit(job)
-            filling = [j for j in self.active.values() if j.fed < len(j.toks)]
-            decoding = len(self.active) > len(filling)
-            for job in filling:
-                self.prefill(job, decoding)
-            self.cycle()
-
-    def pick_slot(self, toks):
-        """the free slot holding the longest prefix of toks (of at least REUSE_MIN), else the least recently used"""
-        free = [s for s in range(self.args.slots) if s not in self.active]
-
-        def reuse(s):
-            n = common_prefix(self.slot_seq[s], toks)
-            return n if n >= REUSE_MIN else 0
-
-        return max(free, key=lambda s: (reuse(s), -self.slot_used[s]))
+            job = self.waiting[0]
+            if self.active and not job.cancelled and not self.fits(job):
+                break
+            self.admit(self.waiting.popleft())
+        filling = [j for j in self.active.values() if j.fed < len(j.feed)]
+        decoding = len(self.active) > len(filling)
+        for job in filling:
+            self.prefill(job, decoding)
+        self.cycle()
+        self.pool = self.eng.pool_stats()
 
     def admit(self, job):
-        """assigns a slot and the reusable prefix; the rest of the prompt is fed by prefill()"""
+        """opens the job's sequence from the longest cached prefix; the rest of its feed is prefilled by prefill()"""
         if job.cancelled:
             job.events.put(("done", ("length", [], {}, {})))
             return
-        s = job.slot = self.pick_slot(job.toks)
+        s = job.slot = min(set(range(self.args.slots)) - set(self.active))
         self.active[s] = job
-        self.track(s, busy=True, phase="prefill", gen=0, tok_s=0.0, ctx=len(job.toks), started=time.time(), prefill_s=None,
-                   prefill_n=None)
-        try:
-            self.eng.select(s)
-            self.sampling(job.body)
+        first = not job.admitted
+        self.admissions += 1
+        job.admitted = self.admissions
+        if first:
             job.t0 = time.time()
-            job.reused = job.fed = self.prompt_start(job.toks)
+        # every field, so a resume on another seat shows none of its previous job's
+        self.track(s, busy=True, phase="prefill" if first else "resume", gen=job.n_gen,
+                   tok_s=self.rate(job.n_gen, time.time() - job.t1) if job.decoding else 0.0, ctx=len(job.toks),
+                   started=job.t0, prefill_s=job.t1 - job.t0 if job.decoding else None,
+                   prefill_n=len(job.toks) - job.reused if job.decoding else None, prefilled=None, preempts=job.preempts)
+        try:
+            job.seq, job.fed = self.eng.seq_open(job.feed)
+            if first:
+                job.reused = job.fed
+            self.sampling(job)
+            log(f"slot {s}: {'prompt' if first else 'resume'} {len(job.feed)} tok, {job.fed} cached")
         except Exception as e:
             self.fail(job, e)
 
-    def prefill(self, job, chunked):
-        """feeds the job's prompt, one chunk of it while other jobs are decoding (they stall one chunk at most)"""
+    def fits(self, job):
+        """optimistic admission: free blocks plus the cached ones the engine can evict cover the job's feed, one
+        cycle's lookahead and one block of growth per running job.  A preempted job does not count the blocks it
+        left cached: re-admitting it by evicting its own prefix would only preempt it again."""
+        self.pool = self.eng.pool_stats()
+        avail = self.pool["free_blocks"] + self.pool["evictable_blocks"] - job.held
+        need = -(-(len(job.feed) + self.kv_ahead) // self.pool["block_tokens"]) + len(self.active)
+        return need <= avail
+
+    def preempt(self, job):
+        """the KV pool is full: the job leaves (its sequence stays cached as far as snapshots allow) and resumes by
+        recompute from the head of the queue, its stream, parser and counters continuing where they stopped"""
+        s = job.slot
+        del self.active[s]
         try:
-            self.eng.select(job.slot)
-            rest = job.toks[job.fed:]
+            held = self.eng.seq_blocks(job.seq)
+            if job.fed >= len(job.feed):  # decoding: what it generated becomes part of what the resume prefills
+                feed = self.eng.sequence(job.seq)
+            else:
+                feed = job.feed
+            self.eng.seq_close(job.seq, keep=True)
+        except Exception as e:
+            self.fail(job, e)  # closes the sequence (no lane leak)
+            return
+        job.seq, job.feed, job.held = None, feed, held
+        job.preempts += 1
+        self.preempted += 1
+        self.track(s, busy=False, phase="idle")
+        self.waiting.appendleft(job)
+        log(f"slot {s}: KV pool full, preempted after {job.n_gen} tok (preemption {job.preempts}, {len(job.feed)} tok to "
+            f"resume, {len(self.waiting)} waiting)")
+
+    def grow(self, job, call):
+        """runs an engine call that grows job's sequence; on a full pool (cached blocks already evicted) preempts the
+        most recently admitted job and retries.  None: job itself was preempted.  PoolFull: job is the only one."""
+        while True:
+            try:
+                return call()
+            except PoolFull:
+                if len(self.active) <= 1:
+                    raise
+                victim = max(self.active.values(), key=lambda j: j.admitted)
+                self.preempt(victim)
+                if victim is job:
+                    return None
+
+    def prefill(self, job, chunked):
+        """feeds the job's feed, one chunk of it while other jobs are decoding (they stall one chunk at most)"""
+        if self.active.get(job.slot) is not job:  # preempted earlier in this loop
+            return
+        try:
+            rest = job.feed[job.fed:]
             if chunked and len(rest) > self.args.prefill_chunk:
                 # an intermediate chunk ends with a generated token, which the next chunk's position overwrites
-                self.eng.append(rest[:self.args.prefill_chunk])
+                if self.grow(job, lambda: self.eng.append(job.seq, rest[:self.args.prefill_chunk], job.snaps)) is None:
+                    return
                 job.fed += self.args.prefill_chunk
-                self.eng.truncate(job.fed)
+                self.eng.truncate(job.seq, job.fed)
                 self.track(job.slot, prefilled=job.fed)
                 return
-            tok = self.eng.prefill(rest)
-            job.fed = len(job.toks)
+            tok = self.grow(job, lambda: self.eng.prefill(job.seq, rest, job.snaps))
+            if tok is None:
+                return
+            job.fed = len(job.feed)
+            if job.decoding and self.stop_due(job):
+                # preempted when its think stop was due: an unpreempted run forces the stop right after the token
+                # the feed ends with, so the resume's own token is dropped and the next cycle forces the stop
+                self.eng.truncate(job.seq, len(job.feed))
+                return
+        except PoolFull:
+            self.out_of_pool(job)
+            return
         except Exception as e:
             self.fail(job, e)
             return
-        job.t1 = time.time()
-        self.track(job.slot, prefill_s=job.t1 - job.t0, prefill_n=len(job.toks) - job.reused)
+        if not job.decoding:
+            job.decoding = True
+            job.t1 = time.time()
+            self.track(job.slot, prefill_s=job.t1 - job.t0, prefill_n=len(job.toks) - job.reused)
         self.consume(job, [tok])
 
     def cycle(self):
         """one decode cycle of every active job: forced thinking stops one by one, the rest in one batched step"""
         stepping = []
         for s, job in list(self.active.items()):
+            if self.active.get(s) is not job:  # preempted by an earlier job's think stop
+                continue
             if job.cancelled:
                 self.complete(job)
-            elif job.fed < len(job.toks):
+            elif job.fed < len(job.feed):
                 continue
-            elif job.budget and job.n_think >= job.budget and job.parser.mode == "reasoning":
+            elif self.stop_due(job):
                 try:
-                    self.eng.select(s)
-                    tok = self.eng.append(self.eng.tokenize(THINK_STOP))
+                    tok = self.grow(job, lambda job=job: self.eng.append(job.seq, self.eng.tokenize(THINK_STOP)))
+                except PoolFull:
+                    self.out_of_pool(job)
+                    continue
                 except Exception as e:
                     self.fail(job, e)
+                    continue
+                if tok is None:  # preempted: the stop is forced after the resume
                     continue
                 for kind, delta in job.parser.feed(THINK_STOP):
                     job.show(kind, delta)
                 log(f"slot {s}: thinking budget of {job.budget} tokens reached")
-                job.budget = 0
+                job.budget, job.stopped = 0, True
                 self.consume(job, [tok])
             else:
                 stepping.append(s)
-        if not stepping:
-            return
-        try:
-            outs = self.eng.step_batch(stepping)
-        except Exception as e:
-            for s in stepping:
-                self.fail(self.active[s], e)
+        for s in [s for s in stepping if s in self.active]:
+            # a cycle needs its lookahead inside the context; the engine would fail the whole batch otherwise
+            job = self.active[s]
+            try:
+                full = self.eng.seq_len(job.seq) - 1 + self.kv_ahead > self.args.ctx
+            except Exception as e:
+                self.fail(job, e)
+                continue
+            if full:
+                log(f"slot {s}: context full, finishing after {job.n_gen} tok")
+                job.finish = "length"
+                self.complete(job)
+        stepping = [s for s in stepping if s in self.active]
+        while stepping:
+            try:
+                outs = self.eng.step_batch([self.active[s].seq for s in stepping])
+                break
+            except PoolFull:
+                if len(self.active) <= 1:
+                    self.out_of_pool(self.active[stepping[0]])
+                    return
+                self.preempt(max(self.active.values(), key=lambda j: j.admitted))
+                stepping = [s for s in stepping if s in self.active]
+            except Exception as e:
+                for s in stepping:
+                    self.fail(self.active[s], e)
+                return
+        else:
             return
         for s, toks in zip(stepping, outs):
             self.consume(self.active[s], toks)
 
+    @staticmethod
+    def stop_due(job):
+        """the thinking budget is used up and the stop not forced yet"""
+        return job.budget and job.n_think >= job.budget and job.parser.mode == "reasoning"
+
+    def out_of_pool(self, job):
+        """the job runs alone and still cannot grow: it ends as if max_tokens were reached"""
+        log(f"slot {job.slot}: KV pool full with no other job to preempt, finishing after {job.n_gen} tok")
+        job.finish = "length"
+        self.complete(job)
+
     def consume(self, job, toks):
-        """feeds a cycle's tokens to the job; tokens after its end stay in the slot's sequence (truncated on reuse)"""
+        """feeds a cycle's tokens to the job; tokens after its end stay in its sequence (never matched by a later
+        prompt that differs there)"""
         done = False
-        for t in toks:
+        for k, t in enumerate(toks):
             if job.n_gen >= job.max_new:
                 break
             job.n_gen += 1
@@ -606,6 +767,14 @@ class Server:
                 break
             for kind, delta in job.parser.feed(job.dec.decode(self.eng.piece(t))):
                 job.show(kind, delta)
+            if k < len(toks) - 1 and self.stop_due(job):
+                # the stop goes right after the budget's last token, not at the cycle's end, so where it lands does
+                # not depend on how tokens fell into cycles (batch size, a preemption's resume)
+                try:
+                    self.eng.truncate(job.seq, self.eng.seq_len(job.seq) - (len(toks) - 1 - k))
+                    break
+                except Exception as e:
+                    log(f"slot {job.slot}: think stop after the cycle's last token:", repr(e))
         if time.time() - job.shown >= 0.25:
             job.shown = time.time()
             self.track(job.slot, **self.live(job, job.shown - job.t1))
@@ -613,11 +782,18 @@ class Server:
             self.complete(job)
 
     def release(self, job):
-        s = job.slot
-        del self.active[s]
-        self.eng.select(s)
-        self.slot_seq[s] = self.eng.sequence()
-        self.slot_used[s] = time.time()
+        """the job's tokens and state stay cached for its conversation's next request"""
+        del self.active[job.slot]
+        if job.seq is not None:
+            try:
+                self.eng.seq_close(job.seq, keep=True)
+            except Exception as e:
+                log("close failed:", repr(e))
+                try:
+                    self.eng.seq_close(job.seq, keep=False)
+                except Exception as e2:
+                    log("close without caching failed:", repr(e2))
+            job.seq = None
 
     def complete(self, job):
         for kind, delta in job.parser.feed(job.dec.decode(b"", final=True), final=True):
@@ -630,7 +806,7 @@ class Server:
         end = "cancelled" if job.cancelled else job.finish
         log(f"slot {job.slot}: prompt {n_prompt} tok ({job.reused} reused) in {job.t1 - job.t0:.2f} s, {n_gen} tok "
             f"in {t2 - job.t1:.2f} s ({self.rate(n_gen, t2 - job.t1):.1f} tok/s), "
-            f"{end}")
+            f"{end}" + (f", preempted {job.preempts}x" if job.preempts else ""))
         usage = {"prompt_tokens": n_prompt, "completion_tokens": n_gen, "total_tokens": n_prompt + n_gen,
                  "prompt_tokens_details": {"cached_tokens": job.reused}}
         timings = {"prompt_n": n_prompt - job.reused, "prompt_ms": (job.t1 - job.t0) * 1e3, "predicted_n": n_gen,
@@ -643,33 +819,25 @@ class Server:
                                for k, v in json.loads(c["function"]["arguments"]).items()}} for c in calls]}
         if n_gen > 1:  # a 1-token request (warm-up, title) has no decode speed: keep the last real job's figures
             self.last = {"slot": job.slot, "tok_s": timings["predicted_per_second"], "gen": n_gen, "ctx": n_prompt,
-                         "reused": job.reused, "prefill_s": job.t1 - job.t0, "finish": end, "at": t2}
+                         "reused": job.reused, "prefill_s": job.t1 - job.t0, "finish": end, "preempts": job.preempts,
+                         "at": t2}
         self.track(job.slot, busy=False, phase="idle", action=action)
         self.release(job)
         job.events.put(("done", (job.finish, calls, usage, timings)))
 
     def fail(self, job, e):
-        """engine error: the job reports it, its slot starts empty"""
+        """engine error: the job reports it, its sequence is dropped (what other holders share stays cached)"""
         log(f"slot {job.slot} error:", repr(e))
         s = job.slot
         self.active.pop(s, None)
-        try:
-            self.eng.select(s)
-            self.eng.reset()
-        except Exception as e2:
-            log("reset after error failed:", repr(e2))
-        self.slot_seq[s] = []
+        if job.seq is not None:
+            try:
+                self.eng.seq_close(job.seq, keep=False)
+            except Exception as e2:
+                log("closing the sequence after an error failed:", repr(e2))
+            job.seq = None
         self.track(s, busy=False, phase="idle")
         job.events.put(("error", e))
-
-
-def common_prefix(a, b):
-    n = 0
-    for x, y in zip(a, b):
-        if x != y:
-            break
-        n += 1
-    return n
 
 
 def make_handler(srv):
@@ -802,10 +970,13 @@ def main():
     ap.add_argument("--lib", default=os.path.join(os.path.dirname(HERE), "libgeezuz.so"),
                     help="engine library; libgeezuz_tp2.so runs tensor-parallel on two GPUs (MK_DEVICES=a,b)")
     ap.add_argument("--kv", choices=["auto", "f16", "q8"], default="auto",
-                    help="KV cache format (auto: q8_0 only when the fp16 cache does not fit)")
+                    help="KV cache format (auto: q8_0 only when the fp16 pool holds less than one -c sequence)")
+    ap.add_argument("--kv-mem", type=int, default=0,
+                    help="KV pool MB per card (0: the free memory after the slots and a reserve); -c stays the "
+                         "per-request maximum")
     ap.add_argument("--slots", type=int, default=1,
-                    help="requests decoded at once (1..8), each with its own KV cache of -c tokens; with the TP2 "
-                         "library they share one batched cycle")
+                    help="requests decoded at once (1..8), their KV taken from the shared pool as they grow; with the "
+                         "TP2 library they share one batched cycle")
     ap.add_argument("--prefill-chunk", type=int, default=2048,
                     help="prompt tokens fed per step while other requests decode (they stall one chunk at most)")
     ap.add_argument("--think-budget", type=int, default=0,

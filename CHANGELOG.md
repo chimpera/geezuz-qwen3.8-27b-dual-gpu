@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased: shared KV pool, prefix cache, preemption
+
+All requests now take their KV from one paged pool instead of a fixed share per slot, conversations and shared system prompts are cached across requests, and a full pool pauses the newest request instead of failing. Same VRAM, same quality, 0.1 to 0.6 % decode tok/s.
+
+### What changed
+
+- **Paged KV** (`qwen38_mk.cu`, `batch.cuh`, `prefill.cuh`): KV lives in blocks of 64 tokens (fp16) or 128 (q8_0), block-major over all 17 KV layers, with a block table per slot. Attention tiles that straddle two blocks are read from both, so results are bit-identical to the contiguous layout (same KL divergence on both quants).
+- **One pool, any split**: `--kv-mem` sets the pool per card (default: the memory the fixed split used). `-c` is now the maximum of one request, not a per-slot reservation. Q8_0 with fp16 KV and 8 slots holds 208,704 tokens in total (the fixed split: 8 x 24K), and one 117K-token request runs next to four 10K ones.
+- **Prefix cache** (`kv_cache.h`): refcounted blocks with copy-on-write, a radix tree over 64-token blocks, and DeltaNet state snapshots at the end of the system prompt, the start of the last user message, the start of the generation prompt and the end of the prompt (exact positions, never inside drafts). Snapshots take at most a quarter of the pool; eviction is least recently used. A follow-up turn prefilled 57 of 76 tokens from cache: 146 instead of 268 ms.
+- **Preemption** (`server/mk_server.py`): requests are admitted when their prompt fits. When the pool runs full, cached blocks are evicted first, then the most recently admitted request is paused with its tokens cached and resumed at the head of the queue; its stream only pauses. A request that alone outgrows the pool ends with `length`, and only that request.
+- **Server**: `GET /status` adds `kv_pool`, `preempted` and per-slot preemption counts; usage reports `prompt_tokens_details.cached_tokens`; `--think-budget` stops exactly at the budget, also across a pause.
+- **Fixes**: KV rows written by the draft rows past the context end (`KV_AHEAD` = 2 x drafts + 1 rows are now reserved); a thinking stop that overran the context failed the whole batch; a second engine in one process failed on already-enabled peer access.
+- **Tests** (`tests/`): pool fuzz and adversarial scenarios against a content-checking fake device, and a scheduler simulation (816 preemptions, no hang, no lost token). On the GPUs: a debug build that checks the whole pool after every operation ran all server tests and 1,500 random engine operations without a fault.
+- **`MK_HOST_PROF=1`**: host time per decode cycle (KV bookkeeping, row prep + launch, wait for the cards, rest).
+
+### Cost
+
+Two RTX 3090s, fp16 KV, `-d 4`, 512 tokens, mean of 3 runs alternated with the previous build:
+
+| | previous | paged | |
+|---|---|---|---|
+| Q4_K_M, 1 request | 190.9 | 190.4 | -0.3 % |
+| Q4_K_M, 8 requests | 625.7 | 621.9 | -0.6 % |
+| Q8_0, 1 request | 143.5 | 143.2 | -0.2 % |
+| Q8_0, 8 requests | 611.3 | 609.9 | -0.2 % |
+| prefill, 40,634 tokens, Q4_K_M / Q8_0 | 1,596 / 1,565 | 1,593 / 1,563 | -0.2 / -0.1 % |
+
+KV bookkeeping costs under 1 µs per cycle. What remains is about 55 µs per cycle in the kernel at 1 request (block-table lookups) and about 125 µs of host time per batched cycle; both are open.
+
+Greedy output after a pause, or in a different batch, continues correctly but is not always token-identical to an uninterrupted run: the draft/verify path takes a slightly different numeric route (the previous build already differed between batched and solo runs).
+
 ## v0.2.0: batched decode, up to 8 requests in one cycle
 
 Two RTX 3090s, 8 parallel requests, total tok/s: **Q4_K_M 298 to 625 (2.1x)**, Q8_0 561 to 610. One request: Q4_K_M 190 tok/s, Q8_0 144.

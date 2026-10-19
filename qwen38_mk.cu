@@ -36,6 +36,7 @@
 
 #include "ggml.h"
 #include "gguf.h"
+#include "kv_cache.h"
 #include "qwen38_mk.h"
 #include "q8_tile.h"
 
@@ -61,6 +62,10 @@ constexpr int NH = 24, NKV = 4, HD = 256;
 constexpr int NKH = 16, NVH = 48, HK = 128;
 constexpr int QKV = 10240, VD = 6144, QG = 12288, KVD = 1024;
 constexpr int MAXT = 5;
+// a decode cycle at position n writes K/V below n + KV_AHEAD: rows up to n + MAXT - 1, MTP drafts up to
+// n + MAXT (bonus) + MAXT - 2; the batched MTP catch-up's padding stays inside only while mtp_valid = n + 1,
+// which every prefill establishes (step refuses a sequence that never had one)
+constexpr int KV_AHEAD = 2 * MAXT - 1;
 constexpr int MAXR = 32;    // GEMV rows of a batched cycle (all slots' rows; per-slot work stays <= MAXT)
 constexpr int MAXR_DP = 10; // of those, the widest the dp4a GEMVs take (more rows need every matrix Q8_0: mma.cuh)
 constexpr int NT = 512, NW = NT / 32;
@@ -103,6 +108,23 @@ constexpr int SM_ATTN_KV = (4 * ATP * (256 + 8) * 2 > 2 * ATP * (256 + 8) * 2 + 
 constexpr int SM_ATTN = 32 * (256 + 8) * 2 + SM_ATTN_KV + 32 * ATP * 4 + 32 * (ATP + 8) * 2 + 96 * 4; // Q, K/V, S, P, stats
 constexpr int SM_TOTAL = (SM_PARK + 4096 > SM_ATTN ? SM_PARK + 4096 : SM_ATTN);
 static_assert(SM_TOTAL <= 99 * 1024, "shared memory budget");
+// KV arena geometry: blocks of NP positions, [blk][att layer][kv head][K|V][NP][HD]; a q8 K or V
+// sub-block holds its int8 rows [NP][HD] then their fp16 scales [NP][HD / 32]
+template <bool Q8>
+struct KvL {
+    static constexpr int NP = Q8 ? 128 : 64, SH = Q8 ? 7 : 6; // positions per block, log2
+    static constexpr int RB = Q8 ? HD : HD * 2;                // bytes of one K or V row's values
+    static constexpr size_t SUB = (size_t) NP * (RB + (Q8 ? HD / 32 * 2 : 0)); // one (layer, head, K|V)
+    static constexpr size_t BLK = (size_t) N_ATT_SLOTS * NKV_L * 2 * SUB;
+    static_assert((1 << SH) == NP, "kv_row / kv_tile index with pos >> SH and mask with NP - 1");
+};
+// the decode tile straddles at most one block boundary only while a tile fits in a block
+static_assert(ATP <= KvL<false>::NP && ATP <= KvL<true>::NP && KvL<false>::NP % ATP == 0 && KvL<true>::NP % ATP == 0);
+static_assert(KvL<false>::SUB % 16 == 0 && KvL<true>::SUB % 16 == 0);
+// one lane's DeltaNet state (floats), and what a snapshot keeps besides it: the conv rows of the 3 positions
+// before it and the h ring
+constexpr size_t DS_N = (size_t) 48 * NVH_L * 128 * 128;
+constexpr size_t SNAP_STAGE = (size_t) 3 * 48 * QKV_L + (size_t) H_RING * D;
 
 enum { T_F32 = 0, T_Q8_0 = 8, T_Q4K = 12, T_Q5K = 13, T_Q6K = 14 };
 // MK_OPT bits for A/B runs without a rebuild: switching gemv_mma, no next-phase L2 weight prefetch in
@@ -170,8 +192,7 @@ constexpr int MAXB = 8; // sequence slots
 struct SeqBufs {
     Ctl * ctl;
     float *conv, *kvgb, *dstate;
-    void *kc, *vc;     // KV cache [slot][kv head][ctx][HD]: fp16, or int8 (q8_0) when kvq8 ...
-    __half *ksc, *vsc; // ... with one fp16 scale per 32 values: [slot][kv head][ctx][HD / 32]
+    const int * bt; // block table: arena block of positions [i * NP, (i + 1) * NP) (KvL), ceil(ctx / NP) entries
     float *h_hist, *hm;
     float2 * dcand; // [MAXT][TOPK_MAX] each MTP draft's normalised distribution q, descending (q[0] = 0: point-mass draft)
 };
@@ -184,6 +205,7 @@ struct Bufs {
     SeqBufs sq[MAXB];
     int nseq;
     int kvq8;
+    uint8_t * kv; // KV arena (KvL<kvq8>): fp16 K/V, or int8 (q8_0) with one fp16 scale per 32 values
     float * apart;
     float2 * aml;
     const float2 * rope; // [ctx][32] (cos, sin) of pos * base^(-2i/64)
@@ -218,6 +240,47 @@ template <int BS>
 __device__ __forceinline__ const SeqBufs & sqx(int s) {
     if constexpr (BS) return cB.sq[s];
     else return cS;
+}
+
+// K / V rows of (attention layer, kv head, position) in sequence S's blocks; ks / vs: their q8 scales
+struct KvRow {
+    uint8_t *k, *v;
+    __half *ks, *vs;
+};
+template <bool Q8>
+__device__ __forceinline__ KvRow kv_row(const SeqBufs & S, int layer, int g, int pos) {
+    using K = KvL<Q8>;
+    const int r = pos & (K::NP - 1);
+    uint8_t * sub = cB.kv + (size_t) __ldg(S.bt + (pos >> K::SH)) * K::BLK + (size_t) (layer * NKV_L + g) * 2 * K::SUB;
+    __half * sc = reinterpret_cast<__half *>(sub + K::NP * K::RB) + r * (HD / 32);
+    return {sub + r * K::RB, sub + K::SUB + r * K::RB, sc, reinterpret_cast<__half *>(reinterpret_cast<uint8_t *>(sc) + K::SUB)};
+}
+
+// rows of a tile of positions tb .. tb + np - 1 (np <= NP, so at most one block boundary)
+struct KvTile {
+    const uint8_t *a, *b; // K sub-blocks holding the rows before / from the boundary
+    int o, split;         // row of tb in a; tile rows < split lie in a
+};
+template <bool Q8>
+__device__ __forceinline__ KvTile kv_tile(const SeqBufs & S, int layer, int g, int tb, int np) {
+    using K = KvL<Q8>;
+    const size_t sub = (size_t) (layer * NKV_L + g) * 2 * K::SUB;
+    const int o = tb & (K::NP - 1);
+    return {cB.kv + (size_t) __ldg(S.bt + (tb >> K::SH)) * K::BLK + sub,
+            cB.kv + (size_t) __ldg(S.bt + ((tb + max(np, 1) - 1) >> K::SH)) * K::BLK + sub, o, K::NP - o};
+}
+// values of tile row p of K (which 0) or V (which 1)
+template <bool Q8>
+__device__ __forceinline__ const uint8_t * kv_tile_row(const KvTile & t, int p, int which) {
+    using K = KvL<Q8>;
+    const uint8_t * sub = (p < t.split ? t.a : t.b) + which * K::SUB;
+    return sub + (size_t) (p < t.split ? t.o + p : p - t.split) * K::RB;
+}
+// fp16 scales of q8 tile row p of K (which 0) or V (which 1)
+__device__ __forceinline__ const __half * kv_tile_scales(const KvTile & t, int p, int which) {
+    using K = KvL<true>;
+    const uint8_t * sub = (p < t.split ? t.a : t.b) + which * K::SUB + K::NP * K::RB;
+    return reinterpret_cast<const __half *>(sub) + (p < t.split ? t.o + p : p - t.split) * (HD / 32);
 }
 
 struct Launch {
@@ -1739,16 +1802,14 @@ __device__ __forceinline__ void kv_tile_to_f16(const uint8_t * src, __half * dK,
     }
 }
 
-// async copy of q8 K/V rows r < np (positions row0 + r) into the staging layout (rows >= np: zero scales)
-__device__ __forceinline__ void kv_stage(const SeqBufs & S, uint8_t * dst, size_t row0, int rows, int np) {
-    const int8_t * Kq = static_cast<const int8_t *>(S.kc), * Vq = static_cast<const int8_t *>(S.vc);
+// async copy of q8 K/V tile rows r < np into the staging layout (rows >= np: zero scales)
+__device__ __forceinline__ void kv_stage(const KvTile & t, uint8_t * dst, int rows, int np) {
     for (int i = threadIdx.x; i < 2 * rows * 17; i += blockDim.x) {
         const int which = i / (rows * 17), r = (i / 17) % rows, c = i % 17;
         uint8_t * d = dst + (size_t) (which * rows + r) * KVQ_ROW + 16 * c;
         if (r < np) {
-            const size_t row = row0 + r;
-            if (c < 16) cp_async16(d, (which ? Vq : Kq) + row * HD + 16 * c);
-            else cp_async16(d, (which ? S.vsc : S.ksc) + row * (HD / 32));
+            if (c < 16) cp_async16(d, kv_tile_row<true>(t, r, which) + 16 * c);
+            else cp_async16(d, kv_tile_scales(t, r, which));
         } else if (c == 16) {
             *reinterpret_cast<int4 *>(d) = make_int4(0, 0, 0, 0);
         }
@@ -1763,22 +1824,26 @@ __device__ __forceinline__ void attn_dims(int L_ctx, int & nch, int & cs) {
 
 // first K / V tile (positions < n) of the attention items of one sequence that global item i0 + k * gridDim.x
 // covers, its items numbered from ibase
-__device__ __forceinline__ void pf_attn_kv(const SeqBufs & S, int slot, int n, int T, int i0, int ibase) {
+template <bool Q8>
+__device__ __forceinline__ void pf_attn_kv_t(const SeqBufs & S, int slot, int n, int T, int i0, int ibase) {
     int nch, CS;
     attn_dims(n + T, nch, CS);
-    const size_t ctx = cB.ctx;
-    const int rowb = cB.kvq8 ? HD : HD * 2, lines = rowb / 128; // bytes, 128-byte lines per K / V row
-    const uint8_t * Kc = static_cast<const uint8_t *>(S.kc) + (size_t) slot * NKV_L * ctx * rowb;
-    const uint8_t * Vc = static_cast<const uint8_t *>(S.vc) + (size_t) slot * NKV_L * ctx * rowb;
+    constexpr int lines = KvL<Q8>::RB / 128; // 128-byte lines per K / V row
+    static_assert(KvL<Q8>::NP >= 64, "the prefetched span straddles at most one block boundary");
     const int G = gridDim.x;
     for (int item = (((i0 - ibase) % G) + G) % G; item < NKV_L * nch; item += G) {
         const int g = item / nch, c0 = (item % nch) * CS, c1 = min(n, min(c0 + CS, c0 + 64));
+        const KvTile t = kv_tile<Q8>(S, slot, g, c0, c1 - c0);
         for (int i = threadIdx.x; i < (c1 - c0) * lines; i += NT) {
-            const size_t off = ((size_t) g * ctx + c0 + i / lines) * rowb + (i % lines) * 128;
-            pf_l2(Kc + off);
-            pf_l2(Vc + off);
+            const uint8_t * k = kv_tile_row<Q8>(t, i / lines, 0) + (i % lines) * 128;
+            pf_l2(k);
+            pf_l2(k + KvL<Q8>::SUB);
         }
     }
+}
+__device__ __forceinline__ void pf_attn_kv(const SeqBufs & S, int slot, int n, int T, int i0, int ibase) {
+    if (cB.kvq8) pf_attn_kv_t<true>(S, slot, n, T, i0, ibase);
+    else pf_attn_kv_t<false>(S, slot, n, T, i0, ibase);
 }
 
 // attention q/k/v projection GEMVs (activations already in shared memory)
@@ -1864,26 +1929,23 @@ __device__ __forceinline__ void attn_item(const LayerW & W, int slot, int n, int
     float * sM = reinterpret_cast<float *>(sP + 32 * LDP);
     float * sL = sM + 32;
     float * sAl = sL + 32;
-    const size_t ctx = cB.ctx;
-    const size_t slot0 = (size_t) slot * NKV_L * ctx; // first row of this slot
-    __half * Kc = static_cast<__half *>(S.kc) + slot0 * HD;
-    __half * Vc = static_cast<__half *>(S.vc) + slot0 * HD;
     const int mt = warp >> 3, wn = warp & 7; // MMA work split: warp -> (row tile, column group)
 
     auto issue_tile = [&](int g, int tb, int np_, int st) {
+        // split-K chunk starts are not tile aligned, so a tile may cross one block boundary
+        const KvTile kt = kv_tile<Q8>(S, slot, g, tb, np_);
         if constexpr (Q8) {
-            kv_stage(S, sKVq + st * 2 * TP * KVQ_ROW, slot0 + (size_t) g * ctx + tb, TP, np_);
+            kv_stage(kt, sKVq + st * 2 * TP * KVQ_ROW, TP, np_);
             asm volatile("cp.async.commit_group;" ::: "memory");
             return;
         }
         __half * sK = sKV + st * 2 * TP * LDH, * sV = sK + TP * LDH;
-        const __half * gK = Kc + ((size_t) g * ctx + tb) * HD;
-        const __half * gV = Vc + ((size_t) g * ctx + tb) * HD;
         for (int i = tid; i < TP * (HD / 8); i += NT) {
             const int p = i >> 5, cc = (i & 31) * 8;
             if (p < np_) {
-                cp_async16(sK + p * LDH + cc, gK + (size_t) p * HD + cc);
-                cp_async16(sV + p * LDH + cc, gV + (size_t) p * HD + cc);
+                const __half * gK = reinterpret_cast<const __half *>(kv_tile_row<false>(kt, p, 0));
+                cp_async16(sK + p * LDH + cc, gK + cc);
+                cp_async16(sV + p * LDH + cc, reinterpret_cast<const __half *>(reinterpret_cast<const uint8_t *>(gK) + KvL<false>::SUB) + cc);
             } else {
                 *reinterpret_cast<int4 *>(sK + p * LDH + cc) = make_int4(0, 0, 0, 0);
                 *reinterpret_cast<int4 *>(sV + p * LDH + cc) = make_int4(0, 0, 0, 0);
@@ -1952,12 +2014,12 @@ __device__ __forceinline__ void attn_item(const LayerW & W, int slot, int n, int
 #pragma unroll
             for (int k = 0; k < 8; k++) v[k] *= rs * W.kn[lane * 8 + k];
             rope8(v, lane, pp);
-            const size_t row = slot0 + (size_t) g * ctx + pp;
-            if constexpr (Q8) kv_store_q8(static_cast<int8_t *>(S.kc) + row * HD, S.ksc + row * (HD / 32), v);
-            else kv_store_f16(static_cast<__half *>(S.kc) + row * HD, v);
+            const KvRow kr = kv_row<Q8>(S, slot, g, pp);
+            if constexpr (Q8) kv_store_q8(reinterpret_cast<int8_t *>(kr.k), kr.ks, v);
+            else kv_store_f16(reinterpret_cast<__half *>(kr.k), v);
             load8(cB.vbuf + (r0 + min(t, nr - 1)) * KVD_L + g * 256 + lane * 8, v);
-            if constexpr (Q8) kv_store_q8(static_cast<int8_t *>(S.vc) + row * HD, S.vsc + row * (HD / 32), v);
-            else kv_store_f16(static_cast<__half *>(S.vc) + row * HD, v);
+            if constexpr (Q8) kv_store_q8(reinterpret_cast<int8_t *>(kr.v), kr.vs, v);
+            else kv_store_f16(reinterpret_cast<__half *>(kr.v), v);
         }
         if (tid < 32) {
             sM[tid] = -INFINITY;
@@ -2983,7 +3045,7 @@ struct HostBarrier {
 
 } // namespace
 
-struct MKEngine::Impl {
+struct MKEngine::Impl : KvDev {
     // TP > 1: one Impl per card; rank 0 (the engine's) owns rank 1's and drives both.
     int rank = 0, dev = 0;
     Impl * peer = nullptr;
@@ -2998,8 +3060,8 @@ struct MKEngine::Impl {
     void * embd_host = nullptr;
     int ctx;
     int nsm = 0;
-    // Host state of one sequence slot.
-    struct SeqHost {
+    // Host state of one open sequence (rank 0): bound to a lane, whose device buffers hold its recurrent state.
+    struct Seq {
         float smp_temp = 0.f, smp_top_p = 1.f, smp_min_p = 0.f; // sampling (temp 0: greedy)
         int smp_top_k = TOPK_MAX;
         unsigned long long smp_seed = 0;
@@ -3008,53 +3070,237 @@ struct MKEngine::Impl {
         bool all_acc = true;  // the last decode cycle accepted all of its drafts
         std::vector<int> seq; // the sequence so far: prompt(s) and emitted tokens (position = index)
         Ctl hctl{};
-        // checkpoint of the state right after the last prefill (recurrent state, conv ring, h ring, ctl):
-        // lets a caller rewind to the end of the last prompt (KV rows before it are never rewritten)
-        float *ck_dstate = nullptr, *ck_conv = nullptr, *ck_hhist = nullptr;
-        Ctl ck_ctl{};
-        int ck_pos = -1;
+        std::vector<int> blk; // KV pool blocks of positions [i * NP, (i + 1) * NP)
+        int lane = -1;
     };
-    int nseq = 1, cur = 0; // slot count and the slot every call acts on
-    std::vector<SeqHost> sh;
-    SeqHost & S() { return sh[cur]; }
-    const SeqHost & S() const { return sh[cur]; }
-    SeqBufs & sb() { return hb.sq[cur]; }
-    // Points this card's next launches at slot s (cS); the peer follows.
-    void select(int s) {
-        if (sub) sub->select(s);
-        use();
-        cur = s;
-        CK(cudaMemcpyToSymbol(cS, &hb.sq[s], sizeof(SeqBufs)));
+    int nseq = 1;    // lanes (sequences open at once)
+    int cur = -1;    // the sequence every call acts on
+    int cs_lane = 0; // the lane cS points at on this card
+    std::map<int, Seq> seqs;
+    int seq_next = 0;
+    Seq dflt; // sampling and draft depth of sequences opened from now on
+    Seq & S() {
+        const auto it = seqs.find(cur);
+        if (it == seqs.end()) throw std::runtime_error("no sequence selected");
+        return it->second;
     }
-    void ck_save() {
-        if (sub) sub->ck_save();
+    const Seq & S() const { return const_cast<Impl *>(this)->S(); }
+    SeqBufs & sb() { return hb.sq[cs_lane]; }
+    // Points this card's next launches at lane l (cS); the peer follows.
+    void select_lane(int l) {
+        if (sub) sub->select_lane(l);
         use();
-        SeqHost & q = S();
-        const size_t ns = (size_t) 48 * NVH_L * 128 * 128, nc = (size_t) 48 * CONV_RING * QKV_L, nh = (size_t) H_RING * D;
-        if (!q.ck_dstate) {
-            q.ck_dstate = dalloc<float>(ns, false);
-            q.ck_conv = dalloc<float>(nc, false);
-            q.ck_hhist = dalloc<float>(nh, false);
+        cs_lane = l;
+        CK(cudaMemcpyToSymbol(cS, &hb.sq[l], sizeof(SeqBufs)));
+    }
+    // the selected sequence, with every card pointed at its lane
+    Seq & focus() {
+        Seq & q = S();
+        if (q.lane != cs_lane) select_lane(q.lane);
+        use();
+        return q;
+    }
+    // focus(), opening a sequence first when none is selected (single-sequence callers never open one)
+    Seq & need() {
+        if (cur < 0) {
+            int r;
+            open_seq({}, r, false);
         }
-        CK(cudaMemcpy(q.ck_dstate, sb().dstate, ns * 4, cudaMemcpyDeviceToDevice));
-        CK(cudaMemcpy(q.ck_conv, sb().conv, nc * 4, cudaMemcpyDeviceToDevice));
-        CK(cudaMemcpy(q.ck_hhist, sb().h_hist, nh * 4, cudaMemcpyDeviceToDevice));
-        CK(cudaMemcpy(&q.ck_ctl, sb().ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
-        q.ck_pos = q.ck_ctl.dn_c;
+        return focus();
     }
-    void ck_restore() {
-        if (sub) sub->ck_restore();
+    // Clears lane l's recurrent state, h ring and Ctl on every card.
+    void lane_reset(int l) {
+        if (sub) sub->lane_reset(l);
         use();
-        SeqHost & q = S();
-        const size_t ns = (size_t) 48 * NVH_L * 128 * 128, nc = (size_t) 48 * CONV_RING * QKV_L, nh = (size_t) H_RING * D;
-        CK(cudaMemcpy(sb().dstate, q.ck_dstate, ns * 4, cudaMemcpyDeviceToDevice));
-        CK(cudaMemcpy(sb().conv, q.ck_conv, nc * 4, cudaMemcpyDeviceToDevice));
-        CK(cudaMemcpy(sb().h_hist, q.ck_hhist, nh * 4, cudaMemcpyDeviceToDevice));
-        q.hctl = q.ck_ctl;
-        q.hctl.mtp_valid = std::min(q.hctl.mtp_valid, q.ck_pos);
-        CK(cudaMemcpy(sb().ctl, &q.hctl, sizeof(Ctl), cudaMemcpyHostToDevice));
-        q.seq.resize(q.ck_pos);
+        const SeqBufs & b = hb.sq[l];
+        CK(cudaMemset(b.dstate, 0, sizeof(float) * DS_N));
+        CK(cudaMemset(b.h_hist, 0, sizeof(float) * (size_t) H_RING * D));
+        CK(cudaMemset(b.ctl, 0, sizeof(Ctl)));
+        CK(cudaMemset(hb.cnt, 0, 16));
     }
+    // Opens a sequence on a free lane and selects it; look: resume from the prefix cache (reused tokens of prompt).
+    int open_seq(const std::vector<int> & prompt, int & reused, bool look) {
+        Seq q = dflt;
+        const auto o = kc->open(prompt.data(), (int) prompt.size(), look, q.blk);
+        q.lane = o.lane;
+        select_lane(o.lane);
+        if (o.pos == 0) {
+            lane_reset(o.lane);
+        } else {
+            q.hctl = o.meta;
+            q.hctl.n = q.hctl.dn_c = o.pos;
+            q.hctl.mtp_valid = std::min(q.hctl.mtp_valid, o.pos);
+            q.seq.assign(prompt.begin(), prompt.begin() + o.pos);
+            put_ctl(q.hctl);
+            dv_add(q.seq.data(), q.seq.size());
+        }
+        reused = o.pos;
+        const int id = seq_next++;
+        seqs[id] = std::move(q);
+        cur = id;
+        return id;
+    }
+    // Snapshot of the selected sequence's state at its committed position (just put on the device), for reuse.
+    void snap_take(Seq & q) {
+        Ctl m = q.hctl;
+        m.n = m.dn_c;
+        m.mtp_valid = std::min(m.mtp_valid, m.dn_c);
+        kc->snap_take(q.seq.data(), m.dn_c, q.blk, q.lane, m);
+    }
+    void dv_rebuild() {
+        dv_reset();
+        for (const auto & kv : seqs) dv_add(kv.second.seq.data(), kv.second.seq.size());
+    }
+
+    // ---------------- KV pool ----------------
+    // Rank 0 owns the bookkeeping (kv_cache.h); every card holds the same block ids, so one host table feeds both.
+    std::unique_ptr<KvCache<Ctl>> kc;
+    int nblk_lane = 0;      // block-table entries per lane: ceil(ctx / NP)
+    int * bt_dev = nullptr;  // this card's block tables [nseq][nblk_lane]
+    int * bt_host = nullptr; // rank 0: pinned mirror, the source of the async uploads
+    float * snap_stage = nullptr; // a snapshot's conv rows and h ring on their way to / from the pool
+    std::vector<cudaEvent_t> bt_ev; // per lane: its last block-table upload on this card (bt_host is its source)
+    int kv_np() const { return hb.kvq8 ? KvL<true>::NP : KvL<false>::NP; }
+    size_t blk_bytes() const { return hb.kvq8 ? KvL<true>::BLK : KvL<false>::BLK; }
+
+    // Sizes the pool on every card (the smallest card decides the block count) and builds empty tables.
+    void pool_init() {
+        // allocated lazily besides the pool: prefill scratch and runtime (~1.5 GB)
+        const size_t reserve = (size_t) 1536 * 1024 * 1024;
+        std::vector<Impl *> cards{this};
+        if (peer) cards.push_back(peer);
+        auto fit = [&](size_t blk_b) {
+            size_t nb = SIZE_MAX;
+            for (Impl * e : cards) {
+                e->use();
+                size_t free_b = 0, total_b = 0;
+                CK(cudaMemGetInfo(&free_b, &total_b));
+                const size_t avail = free_b > reserve ? free_b - reserve : 0;
+                if (kv_mem > 0 && (size_t) kv_mem * 1024 * 1024 > avail)
+                    throw std::runtime_error("kv_mem " + std::to_string(kv_mem) + " MB exceeds the free memory of device " +
+                                             std::to_string(e->dev) + " (" + std::to_string(avail >> 20) + " MB after the reserve)");
+                nb = std::min(nb, (kv_mem > 0 ? (size_t) kv_mem * 1024 * 1024 : avail) / blk_b);
+            }
+            return nb;
+        };
+        const int lane16 = (ctx + KvL<false>::NP - 1) / KvL<false>::NP;
+        const bool q8 = kv_mode == 1 || (kv_mode < 0 && fit(KvL<false>::BLK) < (size_t) lane16);
+        const size_t blk_b = q8 ? KvL<true>::BLK : KvL<false>::BLK;
+        const int np = q8 ? KvL<true>::NP : KvL<false>::NP;
+        const size_t nbz = std::min(fit(blk_b), (size_t) INT32_MAX);
+        const int nb = (int) nbz;
+        nblk_lane = (ctx + np - 1) / np;
+        if (nb < nblk_lane)
+            throw std::runtime_error("KV pool holds " + std::to_string((size_t) nb * np) + " tokens, less than one ctx sequence (" +
+                                     std::to_string(ctx) + "): lower -c or raise kv_mem");
+        for (Impl * e : cards) {
+            e->use();
+            e->nblk_lane = nblk_lane;
+            e->hb.kvq8 = q8;
+            e->hb.kv = e->dalloc<uint8_t>((size_t) nb * blk_b);
+            e->bt_dev = e->dalloc<int>((size_t) nseq * nblk_lane); // zeroed: unused entries still name a valid block
+            for (int s = 0; s < nseq; s++) e->hb.sq[s].bt = e->bt_dev + (size_t) s * nblk_lane;
+            e->bt_ev.resize(nseq);
+            for (cudaEvent_t & ev : e->bt_ev) CK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+            CK(cudaMemcpyToSymbol(cB, &e->hb, sizeof(Bufs)));
+            CK(cudaMemcpyToSymbol(cS, &e->hb.sq[e->cs_lane], sizeof(SeqBufs)));
+        }
+        use();
+        CK(cudaHostAlloc(&bt_host, (size_t) nseq * nblk_lane * sizeof(int), cudaHostAllocDefault));
+        memset(bt_host, 0, (size_t) nseq * nblk_lane * sizeof(int));
+        const int snap_nb = (int) (((DS_N + SNAP_STAGE) * 4 + blk_b - 1) / blk_b);
+        kc = std::make_unique<KvCache<Ctl>>(nb, np, nblk_lane, snap_nb, nseq, this);
+        fprintf(stderr, "[mk] KV pool %s, %.2f GB = %d blocks of %d tokens (max %zu tokens), %d lanes x %d ctx; a DeltaNet "
+                        "snapshot takes %d blocks, snapshots at most %d blocks%s\n",
+                q8 ? "q8_0" : "fp16", (double) nb * blk_b / 1e9, nb, np, (size_t) nb * np, nseq, ctx, snap_nb, kc->snap_cap(),
+                snap_nb > kc->snap_cap() ? " (too small: no prefix cache)" : "");
+    }
+
+    // KvDev: the cache's device work, stream-ordered on every card before the next launch
+    void copy_block(int src, int dst) override {
+        const size_t bb = blk_bytes();
+        for (Impl * e : {this, peer}) {
+            if (!e) continue;
+            e->use();
+            CK(cudaMemcpyAsync(e->hb.kv + (size_t) dst * bb, e->hb.kv + (size_t) src * bb, bb, cudaMemcpyDeviceToDevice, 0));
+        }
+        use();
+    }
+    void upload_bt(int lane, int i0, const int * ids, int k) override {
+        // pinned source, so truly async: the lane's previous upload must have read it before it is rewritten
+        for (Impl * e : {this, peer})
+            if (e) {
+                e->use();
+                CK(cudaEventSynchronize(e->bt_ev[lane]));
+            }
+        int * h = bt_host + (size_t) lane * nblk_lane + i0;
+        std::copy(ids, ids + k, h);
+        for (Impl * e : {this, peer}) {
+            if (!e) continue;
+            e->use();
+            CK(cudaMemcpyAsync(e->bt_dev + (size_t) lane * nblk_lane + i0, h, k * sizeof(int), cudaMemcpyHostToDevice, 0));
+            CK(cudaEventRecord(e->bt_ev[lane], 0));
+        }
+        use();
+    }
+    void snap_save(int lane, int pos, const std::vector<int> & blks) override { snap_copy(lane, pos, blks, true); }
+    void snap_load(int lane, int pos, const std::vector<int> & blks) override { snap_copy(lane, pos, blks, false); }
+    // Lane l's DeltaNet state at position p (recurrent state, conv rows of positions p-3 .. p-1, h ring) as one byte
+    // stream laid over pool blocks blks: saved into them or loaded from them, on every card.
+    void snap_copy(int l, int p, const std::vector<int> & blks, bool save) {
+        if (sub) sub->snap_copy(l, p, blks, save);
+        use();
+        const SeqBufs & b = hb.sq[l];
+        const size_t bb = blk_bytes(), row = (size_t) QKV_L * 4;
+        float * cv = snap_stage;
+        float * hh = snap_stage + (size_t) 3 * 48 * QKV_L;
+        auto ring = [&](int j) { return b.conv + (size_t) (((p - 3 + j) % CONV_RING + CONV_RING) % CONV_RING) * QKV_L; };
+        if (save) {
+            for (int j = 0; j < 3; j++)
+                CK(cudaMemcpy2DAsync(cv + (size_t) j * 48 * QKV_L, row, ring(j), CONV_RING * row, row, 48, cudaMemcpyDeviceToDevice, 0));
+            CK(cudaMemcpyAsync(hh, b.h_hist, (size_t) H_RING * D * 4, cudaMemcpyDeviceToDevice, 0));
+        }
+        const std::pair<uint8_t *, size_t> parts[2] = {{reinterpret_cast<uint8_t *>(b.dstate), DS_N * 4},
+                                                       {reinterpret_cast<uint8_t *>(snap_stage), SNAP_STAGE * 4}};
+        size_t off = 0;
+        for (const auto & pc : parts)
+            for (size_t o = 0; o < pc.second;) {
+                const size_t k = std::min(pc.second - o, bb - off % bb);
+                uint8_t * dst = hb.kv + (size_t) blks.at(off / bb) * bb + off % bb;
+                CK(cudaMemcpyAsync(save ? dst : pc.first + o, save ? pc.first + o : dst, k, cudaMemcpyDeviceToDevice, 0));
+                o += k;
+                off += k;
+            }
+        if (!save) {
+            for (int j = 0; j < 3; j++)
+                CK(cudaMemcpy2DAsync(ring(j), CONV_RING * row, cv + (size_t) j * 48 * QKV_L, row, row, 48, cudaMemcpyDeviceToDevice, 0));
+            CK(cudaMemcpyAsync(b.h_hist, hh, (size_t) H_RING * D * 4, cudaMemcpyDeviceToDevice, 0));
+        }
+    }
+    // MK_DEBUG_POOL builds: every refcount, the free list and the block tables against their holders after each call.
+    void pool_check() {
+#ifdef MK_DEBUG_POOL
+        std::vector<const std::vector<int> *> v;
+        std::vector<int> dev_bt(nblk_lane);
+        for (const auto & kv : seqs) {
+            const Seq & q = kv.second;
+            v.push_back(&q.blk);
+            for (const auto & kw : seqs)
+                if (kw.first != kv.first && kw.second.lane == q.lane) throw std::logic_error("KV pool check: two sequences on one lane");
+            for (Impl * e : {this, peer}) {
+                if (!e || q.blk.empty()) continue;
+                e->use();
+                CK(cudaMemcpy(dev_bt.data(), e->bt_dev + (size_t) q.lane * nblk_lane, q.blk.size() * sizeof(int), cudaMemcpyDeviceToHost));
+                for (size_t i = 0; i < q.blk.size(); i++)
+                    if (dev_bt[i] != q.blk[i] || bt_host[(size_t) q.lane * nblk_lane + i] != q.blk[i])
+                        throw std::logic_error("KV pool check: block table of sequence " + std::to_string(kv.first) + " entry " + std::to_string(i));
+            }
+            use();
+        }
+        kc->check(v);
+#endif
+    }
+
     // draft vocabulary: ids of head_d rows (base list + tokens added from the sequence)
     std::vector<int> dv_ids;
     std::vector<uint8_t> dv_in;
@@ -3374,13 +3620,15 @@ struct MKEngine::Impl {
     }
 
     int n_draft_max;
-    int kv_mode; // KV cache format: 0 fp16, 1 q8_0, -1 auto (q8_0 when fp16 does not fit)
-    Impl(const std::string & path, int ctx_, int ndraft_, const std::string & draft_vocab, int kv_mode_, int nseq_, int rank_ = 0)
-        : rank(rank_), dev(mk_device(rank_)), file(path), ctx(ctx_), n_draft_max(ndraft_), kv_mode(kv_mode_) {
-        if (nseq_ < 1 || nseq_ > MAXB) throw std::runtime_error("sequence slots must be in [1, " + std::to_string(MAXB) + "]");
+    int kv_mode; // KV cache format: 0 fp16, 1 q8_0, -1 auto (q8_0 when the fp16 pool holds less than one ctx sequence)
+    int kv_mem;  // KV pool MB per card, 0: the free memory after everything else
+    Impl(const std::string & path, int ctx_, int ndraft_, const std::string & draft_vocab, int kv_mode_, int nseq_, int kv_mem_,
+         int rank_ = 0)
+        : rank(rank_), dev(mk_device(rank_)), file(path), ctx(ctx_), n_draft_max(ndraft_), kv_mode(kv_mode_), kv_mem(kv_mem_) {
+        if (kv_mem_ < 0) throw std::runtime_error("kv_mem must be >= 0 (MB per card, 0: all free memory)");
+        if (nseq_ < 1 || nseq_ > MAXB) throw std::runtime_error("lanes (n_seq) must be in [1, " + std::to_string(MAXB) + "]");
         nseq = nseq_;
-        sh.resize(nseq);
-        for (auto & q : sh) q.ndraft = q.nd_avail = ndraft_;
+        dflt.ndraft = dflt.nd_avail = ndraft_;
         if (file.strs["general.architecture"] != "qwen35") throw std::runtime_error("expected qwen35 architecture");
         if (file.ints["qwen35.block_count"] != NLA || file.ints["qwen35.embedding_length"] != D)
             throw std::runtime_error("unexpected model dimensions (this kernel is specialised for the 27B)");
@@ -3395,10 +3643,19 @@ struct MKEngine::Impl {
             if (!a || !b)
                 throw std::runtime_error("TP=2 needs two distinct GPUs with peer-to-peer access both ways (devices " +
                                          std::to_string(dev) + ", " + std::to_string(d1) + ")");
+            // Peer access outlives an engine, so a second engine in the same process finds it already enabled.
+            auto peer = [](int to) {
+                cudaError_t e = cudaDeviceEnablePeerAccess(to, 0);
+                if (e == cudaErrorPeerAccessAlreadyEnabled) {
+                    cudaGetLastError();
+                    e = cudaSuccess;
+                }
+                CK(e);
+            };
             CK(cudaSetDevice(d1));
-            CK(cudaDeviceEnablePeerAccess(dev, 0));
+            peer(dev);
             CK(cudaSetDevice(dev));
-            CK(cudaDeviceEnablePeerAccess(d1, 0));
+            peer(d1);
         }
 #endif
         use();
@@ -3611,40 +3868,27 @@ struct MKEngine::Impl {
         hb.vbuf = dalloc<float>(MAXR * KVD_L);
         hb.qkvs = dalloc<float>((size_t) MAXR * QKV_L);
         {
-            const size_t rows = (size_t) N_ATT_SLOTS * NKV_L * ctx;
-            // per slot besides the KV cache: recurrent state, conv ring, delta-net ring, h ring and checkpoint copies
-            const size_t seq_b = 2 * ((size_t) 48 * NVH_L * 128 * 128 + (size_t) 48 * CONV_RING * QKV_L + (size_t) H_RING * D) * 4 +
-                                 (size_t) 48 * KV_RING * KVGB_L * 4;
-            size_t free_b = 0, total_b = 0;
-            CK(cudaMemGetInfo(&free_b, &total_b));
-            // fp16 needs 2 x rows x HD x 2 bytes per slot; leave ~1.5 GB for the prefill buffers and runtime
-            const bool q8 = kv_mode == 1 ||
-                            (kv_mode < 0 && nseq * (rows * HD * 4 + seq_b) + (size_t) 1536 * 1024 * 1024 > free_b);
-            hb.kvq8 = q8;
+            // the KV pool and block tables come later (pool_init), once both cards' free memory is known
             for (int s = 0; s < nseq; s++) {
                 SeqBufs & b = hb.sq[s];
                 b.conv = dalloc<float>((size_t) 48 * CONV_RING * QKV_L);
                 b.kvgb = dalloc<float>((size_t) 48 * KV_RING * KVGB_L);
                 b.dstate = dalloc<float>((size_t) 48 * NVH_L * 128 * 128);
-                b.kc = q8 ? (void *) dalloc<int8_t>(rows * HD) : (void *) dalloc<__half>(rows * HD);
-                b.vc = q8 ? (void *) dalloc<int8_t>(rows * HD) : (void *) dalloc<__half>(rows * HD);
-                b.ksc = q8 ? dalloc<__half>(rows * (HD / 32)) : nullptr;
-                b.vsc = q8 ? dalloc<__half>(rows * (HD / 32)) : nullptr;
                 b.h_hist = dalloc<float>((size_t) H_RING * D);
                 b.hm = dalloc<float>(D);
                 b.ctl = dalloc<Ctl>(1);
                 b.dcand = dalloc<float2>((size_t) MAXT * TOPK_MAX);
             }
             hb.nseq = nseq;
-            fprintf(stderr, "[mk] KV cache %s, %.2f GB for %d slot(s) x %d positions\n", q8 ? "q8_0" : "fp16",
-                    nseq * rows * HD * (q8 ? 2.0 + 2.0 * 2 / 32 : 4.0) / 1e9, nseq, ctx);
+            snap_stage = dalloc<float>(SNAP_STAGE, false);
         }
         // a batched cycle's attention items of all slots: up to MAXB x NKV_L x MAX_CH
         hb.apart = dalloc<float>((size_t) MAXB * NKV_L * MAX_CH * AR * 256);
         hb.aml = dalloc<float2>((size_t) MAXB * NKV_L * MAX_CH * AR);
         {
-            std::vector<float2> rt((size_t) ctx * 32);
-            for (int p = 0; p < ctx; p++)
+            const int rope_n = (ctx + KvL<true>::NP - 1) / KvL<true>::NP * KvL<true>::NP; // whole blocks of either format
+            std::vector<float2> rt((size_t) rope_n * 32);
+            for (int p = 0; p < rope_n; p++)
                 for (int i = 0; i < 32; i++) {
                     const double th = (double) p * std::pow((double) ROPE_BASE, -2.0 * i / 64.0);
                     rt[(size_t) p * 32 + i] = make_float2((float) std::cos(th), (float) std::sin(th));
@@ -3690,7 +3934,7 @@ struct MKEngine::Impl {
                 rank, MK_TP, nsm, ctx, n_draft_max);
 #if MK_TP > 1
         if (rank == 0) {
-            sub = std::make_unique<Impl>(path, ctx_, ndraft_, draft_vocab, kv_mode_, nseq_, 1);
+            sub = std::make_unique<Impl>(path, ctx_, ndraft_, draft_vocab, kv_mode_, nseq_, kv_mem_, 1);
             if (sub->nsm != nsm) throw std::runtime_error("TP=2 needs two GPUs with the same SM count (equal grids)");
             peer = sub.get();
             sub->peer = this;
@@ -3713,14 +3957,17 @@ struct MKEngine::Impl {
             use();
         }
 #endif
+        if (rank == 0) pool_init();
     }
 
     ~Impl() {
         sub.reset();
         use();
         print_profile();
+        if (bt_host) cudaFreeHost(bt_host);
         for (cudaEvent_t e : ev_done)
             if (e) cudaEventDestroy(e);
+        for (cudaEvent_t e : bt_ev) cudaEventDestroy(e);
         for (void * p : allocs) cudaFree(p);
         if (embd_host) cudaFreeHost(embd_host);
     }
@@ -3798,7 +4045,7 @@ struct MKEngine::Impl {
 
     void launch(int mode, int T, int last, int score = 0) {
         use();
-        const SeqHost & q = S();
+        const Seq & q = S();
         Launch P{mode, T, last, q.ndraft, score, q.smp_temp, q.smp_top_p, q.smp_min_p, q.smp_top_k, q.smp_seed, draft_prob};
         if (profiling) CK(cudaMemsetAsync(hb.prof, 0, PROF_N * 8));
         coop(P);
@@ -4248,57 +4495,97 @@ struct MKEngine::Impl {
         CK(cudaDeviceSynchronize());
         if (rank == 0) pf_report();
     }
-
-    void reset() {
-        if (sub) sub->reset();
-        use();
-        CK(cudaMemset(sb().dstate, 0, sizeof(float) * (size_t) 48 * NVH_L * 128 * 128));
-        CK(cudaMemset(sb().h_hist, 0, sizeof(float) * (size_t) H_RING * D));
-        memset(&S().hctl, 0, sizeof(Ctl));
-        CK(cudaMemcpy(sb().ctl, &S().hctl, sizeof(Ctl), cudaMemcpyHostToDevice));
-        CK(cudaMemset(hb.cnt, 0, 16));
-    }
 };
 
-MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::string & draft_vocab, int kv_mode, int n_seq)
+MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::string & draft_vocab, int kv_mode, int n_seq,
+                   int kv_mem)
     : p_(nullptr), n_draft_(n_draft) {
     if (n_draft < 0 || n_draft > MAXT - 1) throw std::runtime_error("n_draft must be in [0, " + std::to_string(MAXT - 1) + "]");
-    p_ = new Impl(path, ctx, n_draft, draft_vocab, kv_mode, n_seq);
-    for (int s = n_seq - 1; s >= 0; s--) {
-        p_->select(s);
-        reset();
-    }
+    p_ = new Impl(path, ctx, n_draft, draft_vocab, kv_mode, n_seq, kv_mem);
+    for (int l = 0; l < n_seq; l++) p_->lane_reset(l);
 }
 
 int MKEngine::n_seq() const { return p_->nseq; }
 int MKEngine::selected() const { return p_->cur; }
-void MKEngine::select(int s) {
-    if (s < 0 || s >= p_->nseq) throw std::runtime_error("select: no sequence slot " + std::to_string(s));
-    if (s != p_->cur) p_->select(s);
+void MKEngine::select(int id) {
+    if (!p_->seqs.count(id)) throw std::runtime_error("select: no open sequence " + std::to_string(id));
+    p_->cur = id;
+    p_->focus();
 }
 
 MKEngine::~MKEngine() { delete p_; }
 
-void MKEngine::bench_phases() { p_->bench(); }
-
-void MKEngine::reset() {
-    p_->reset();
-    p_->S().seq.clear();
-    p_->S().ck_pos = -1;
-    // The draft head's added rows are shared by all slots: rebuild them from the slots still in use.
-    p_->dv_reset();
-    for (const auto & q : p_->sh) p_->dv_add(q.seq.data(), q.seq.size());
-    if (p_->nseq == 1) stats = MKStats();
+void MKEngine::bench_phases() {
+    p_->need();
+    p_->bench();
 }
 
-int MKEngine::position() const { return p_->S().hctl.n; }
+int MKEngine::seq_open(const std::vector<int> & prompt, int & reused) {
+    const int id = p_->open_seq(prompt, reused, true);
+    p_->pool_check();
+    return id;
+}
 
-int MKEngine::prefill(const std::vector<int> & tokens, bool save_checkpoint) {
+void MKEngine::seq_close(int id, bool keep) {
+    const auto it = p_->seqs.find(id);
+    if (it == p_->seqs.end()) throw std::runtime_error("seq_close: no open sequence " + std::to_string(id));
+    Impl::Seq & q = it->second;
+    // the lane's live state covers the committed positions only; the KV rows below them are final
+    const int pos = std::min(q.hctl.dn_c, (int) q.seq.size());
+    Ctl m = q.hctl;
+    m.n = m.dn_c = pos;
+    m.mtp_valid = std::min(m.mtp_valid, pos);
+    p_->kc->close(q.lane, q.seq.data(), pos, q.blk, keep, m);
+    p_->seqs.erase(it);
+    if (p_->cur == id) p_->cur = -1;
+    // the draft head's added rows are shared by all sequences: rebuild them from the open ones
+    p_->dv_rebuild();
+    p_->pool_check();
+}
+
+void MKEngine::seq_free(int id) { seq_close(id, false); }
+
+int MKEngine::seq_blocks(int id) const {
+    const auto it = p_->seqs.find(id);
+    if (it == p_->seqs.end()) throw std::runtime_error("seq_blocks: no open sequence " + std::to_string(id));
+    return (int) it->second.blk.size();
+}
+
+void MKEngine::reset() {
+    Impl::Seq & q = p_->need();
+    p_->lane_reset(q.lane);
+    q.hctl = Ctl{};
+    q.seq.clear();
+    p_->kc->trim(q.blk, 0);
+    p_->dv_rebuild();
+    if (p_->nseq == 1) stats = MKStats();
+    p_->pool_check();
+}
+
+void MKEngine::pool_stats(int & free_blocks, int & total_blocks, int & block_tokens, int & cached_blocks, int & evictable_blocks) const {
+    const KvCache<Ctl> & k = *p_->kc;
+    free_blocks = k.free_blocks();
+    total_blocks = k.total();
+    block_tokens = p_->kv_np();
+    cached_blocks = k.cached_blocks();
+    evictable_blocks = k.evictable_blocks();
+}
+
+int MKEngine::kv_ahead() { return KV_AHEAD; }
+
+int MKEngine::position() const { return p_->cur < 0 ? 0 : p_->S().hctl.n; }
+
+int MKEngine::prefill(const std::vector<int> & tokens, bool snapshot_end, const std::vector<int> & snap_pos) {
     if (tokens.empty()) throw std::runtime_error("empty prompt");
-    Ctl & c = p_->S().hctl;
+    Impl::Seq & q = p_->need();
+    Ctl & c = q.hctl;
     p_->get_ctl(c);
-    std::vector<int> & seq = p_->S().seq;
-    if ((int) (seq.size() + tokens.size()) + 8 > p_->ctx) throw std::runtime_error("prompt exceeds context");
+    std::vector<int> & seq = q.seq;
+    const int len = (int) (seq.size() + tokens.size());
+    if (len + KV_AHEAD > p_->ctx) throw std::runtime_error("prompt exceeds context"); // room for one decode cycle
+    // every chunk's blocks at once, before any state changes: a short pool leaves the sequence as it was; rows are
+    // rewritten from the committed position on, and the last launch's MTP drafts write up to position len + MAXT - 2
+    p_->kc->ensure(q.blk, q.lane, std::min(c.dn_c, c.mtp_valid), len + MAXT);
     seq.insert(seq.end(), tokens.begin(), tokens.end());
     p_->dv_add(tokens.data(), tokens.size());
     // Everything from the committed delta-net position on is fed: on a continued sequence that is
@@ -4308,71 +4595,87 @@ int MKEngine::prefill(const std::vector<int> & tokens, bool save_checkpoint) {
     const std::vector<int> feed(seq.begin() + n0, seq.end());
     c.mtp_valid = std::min(c.mtp_valid, n0);
     size_t i = 0;
-    bool saved_ck = false;
+    bool snapped = false;
     const char * mode = getenv("MK_PREFILL");
     const bool batched = !(mode && std::string(mode) == "mk");
     if (batched && feed.size() >= 2) {
-        // all but the last token in batched kernels; the last one goes through the megakernel,
-        // which produces the first output token and the MTP drafts
-        const std::vector<int> head(feed.begin(), feed.end() - 1);
-        p_->pf_run(head, n0, nullptr);
-        i = head.size();
-        c.dn_c = n0 + (int) i;
+        // all but the last token in batched kernels, split at the hinted positions, whose states are saved for
+        // other requests; the last token goes through the megakernel, which produces the first output token
+        // and the MTP drafts
+        std::vector<int> cuts;
+        for (int h : snap_pos)
+            if (h >= std::max(n0, 1) && h < len - 1) cuts.push_back(h);
+        std::sort(cuts.begin(), cuts.end());
+        cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
+        int pos = n0;
+        for (int h : cuts) {
+            if (h > pos) {
+                p_->pf_run(std::vector<int>(seq.begin() + pos, seq.begin() + h), pos, nullptr);
+                pos = c.dn_c = c.mtp_valid = h;
+            }
+            p_->snap_take(q);
+        }
+        p_->pf_run(std::vector<int>(seq.begin() + pos, seq.end() - 1), pos, nullptr);
+        i = feed.size() - 1;
+        c.dn_c = len - 1;
         c.mtp_valid = c.dn_c;
-        // Checkpoint before the last prompt token: the next request's re-rendered history re-tokenizes
-        // the generation prompt's tail, so a checkpoint after it would never lie inside the common prefix.
+        // Snapshot before the last prompt token: the next request's re-rendered history re-tokenizes
+        // the generation prompt's tail, so a snapshot after it would never lie inside the common prefix.
         c.n = c.dn_c;
         p_->put_ctl(c);
-        if (save_checkpoint) p_->ck_save();
-        saved_ck = true;
+        if (snapshot_end) p_->snap_take(q);
+        snapped = true;
     }
     while (i < feed.size()) {
         const int T = (int) std::min<size_t>(MAXT, feed.size() - i);
         const bool last = i + T == feed.size();
+        if (last && snapshot_end && !snapped) p_->snap_take(q); // before the last token(s), as the batched path
         c.n = c.dn_c;
         for (int k = 0; k < T; k++) c.tok[k] = feed[i + k];
         p_->put_ctl(c);
-        p_->S().ndraft = p_->n_draft_max;
+        q.ndraft = p_->n_draft_max;
         p_->launch(MODE_PREFILL, T, last ? 1 : 0);
         p_->get_ctl(c);
         i += T;
     }
-    p_->S().nd_avail = p_->S().ndraft;
-    p_->S().all_acc = true;
+    q.nd_avail = q.ndraft;
+    q.all_acc = true;
     CK(cudaGetLastError());
-    if (save_checkpoint && !saved_ck) p_->ck_save();
     seq.push_back(c.out[0]);
+    p_->pool_check();
     return c.out[0];
 }
 
 void MKEngine::set_sampling(float temp, float top_p, int top_k, float min_p, unsigned long long seed) {
     if (temp > 0.f && (top_k <= 0 || top_k > TOPK_MAX))
         throw std::runtime_error("sampling needs 1 <= top_k <= " + std::to_string(TOPK_MAX));
-    p_->S().smp_temp = temp;
-    p_->S().smp_top_p = top_p;
-    p_->S().smp_top_k = top_k;
-    p_->S().smp_min_p = min_p;
-    p_->S().smp_seed = seed;
+    Impl::Seq & q = p_->cur < 0 ? p_->dflt : p_->S();
+    q.smp_temp = temp;
+    q.smp_top_p = top_p;
+    q.smp_top_k = top_k;
+    q.smp_min_p = min_p;
+    q.smp_seed = seed;
 }
 
-const std::vector<int> & MKEngine::sequence() const { return p_->S().seq; }
-int MKEngine::committed() const { return p_->S().hctl.dn_c; }
-int MKEngine::checkpoint_pos() const { return p_->S().ck_pos; }
-bool MKEngine::rewind_to_checkpoint() {
-    if (p_->S().ck_pos < 0 || p_->S().ck_pos > (int) p_->S().seq.size()) return false;
-    p_->ck_restore();
-    return true;
+const std::vector<int> & MKEngine::sequence() const {
+    static const std::vector<int> none;
+    return p_->cur < 0 ? none : p_->S().seq;
 }
+int MKEngine::committed() const { return p_->cur < 0 ? 0 : p_->S().hctl.dn_c; }
 
 void MKEngine::truncate(int len) {
-    std::vector<int> & seq = p_->S().seq;
-    if (len < p_->S().hctl.dn_c || len > (int) seq.size())
+    Impl::Seq & q = p_->need();
+    if (len < q.hctl.dn_c || len > (int) q.seq.size())
         throw std::runtime_error("truncate: can only drop tokens emitted after the committed position");
-    seq.resize(len);
+    q.seq.resize(len);
+    p_->kc->trim(q.blk, len);
+    p_->pool_check();
 }
 
 std::vector<int> MKEngine::score(const std::vector<int> & tokens) {
     reset();
+    Impl::Seq & q = p_->S();
+    p_->kc->ensure(q.blk, q.lane, 0, (int) tokens.size()); // scoring launches run no MTP drafts
     std::vector<int> pred;
     const char * mode = getenv("MK_PREFILL");
     if (!(mode && std::string(mode) == "mk")) {
@@ -4380,7 +4683,7 @@ std::vector<int> MKEngine::score(const std::vector<int> & tokens) {
         reset();
         return pred;
     }
-    Ctl & c = p_->S().hctl;
+    Ctl & c = q.hctl;
     p_->get_ctl(c);
     size_t i = 0;
     while (i < tokens.size()) {
@@ -4402,10 +4705,12 @@ void MKEngine::score_logits(const std::vector<int> & tokens, int mk_from, int fi
     const int N = (int) tokens.size();
     if (N + 8 > p_->ctx) throw std::runtime_error("sequence exceeds context");
     reset();
+    Impl::Seq & q = p_->S();
+    p_->kc->ensure(q.blk, q.lane, 0, N);
     mk_from = std::min(std::max(mk_from, 0), N);
     if (mk_from > 0)
         p_->pf_run(std::vector<int>(tokens.begin(), tokens.begin() + mk_from), 0, nullptr, first < mk_from ? &sink : nullptr, first);
-    Ctl & c = p_->S().hctl;
+    Ctl & c = q.hctl;
     p_->get_ctl(c);
     c.dn_c = mk_from;
     std::vector<float> rows((size_t) MAXT * VOCAB);
@@ -4426,37 +4731,86 @@ void MKEngine::score_logits(const std::vector<int> & tokens, int mk_from, int fi
     reset();
 }
 
+// MK_HOST_PROF: host time per decode cycle split into KV block bookkeeping, row prep + launch submit, wait for the
+// cards + Ctl readback, and the rest; printed at exit
+static struct HostProf {
+    using C = std::chrono::steady_clock;
+    const bool on = getenv("MK_HOST_PROF") != nullptr;
+    double ns[4] = {};
+    long n = 0;
+    C::time_point t;
+    void start() {
+        if (on) t = C::now();
+    }
+    void lap(int k) {
+        if (!on) return;
+        const C::time_point u = C::now();
+        ns[k] += std::chrono::duration<double, std::nano>(u - t).count();
+        t = u;
+        n += k == 3;
+    }
+    ~HostProf() {
+        if (on && n)
+            fprintf(stderr, "[mk-host] %ld cycles, us/cycle: kv blocks %.1f, prep+submit %.1f, card wait %.1f, rest %.1f\n", n,
+                    ns[0] / n / 1e3, ns[1] / n / 1e3, ns[2] / n / 1e3, ns[3] / n / 1e3);
+    }
+} host_prof;
+
 int MKEngine::step(std::vector<int> & out) {
-    Ctl & c = p_->S().hctl;
-    if (c.n + MAXT + 2 >= p_->ctx) throw std::runtime_error("context full");
-    const int T = 1 + p_->S().nd_avail;
+    Impl::Seq & q = p_->need();
+    Ctl & c = q.hctl;
+    if ((int) q.seq.size() <= c.n) throw std::runtime_error("step: the sequence has no pending token (prefill first)");
+    if (c.n + KV_AHEAD > p_->ctx) throw std::runtime_error("context full");
+    host_prof.start();
+    p_->kc->ensure(q.blk, q.lane, std::min(c.dn_c, c.mtp_valid), c.n + KV_AHEAD);
+    host_prof.lap(0);
+    const int T = 1 + q.nd_avail;
     // Draft depth: after a cycle that rejected a draft, draft one token less (but at least 3), since a
     // deeper draft is then unlikely to be accepted; the full depth again after a fully accepted cycle.
-    p_->S().ndraft = (!p_->S().all_acc && n_draft_ > 3) ? n_draft_ - 1 : n_draft_;
+    q.ndraft = (!q.all_acc && n_draft_ > 3) ? n_draft_ - 1 : n_draft_;
     p_->launch(MODE_DECODE, T, 0);
-    p_->S().nd_avail = p_->S().ndraft;
+    host_prof.lap(1);
+    q.nd_avail = q.ndraft;
     p_->get_ctl(c);
+    host_prof.lap(2);
     for (int i = 0; i < c.n_out; i++) out.push_back(c.out[i]);
-    p_->S().seq.insert(p_->S().seq.end(), c.out, c.out + c.n_out);
+    q.seq.insert(q.seq.end(), c.out, c.out + c.n_out);
     p_->dv_add(c.out, c.n_out);
-    p_->S().all_acc = c.n_acc == T - 1;
+    q.all_acc = c.n_acc == T - 1;
     stats.cycles++;
     stats.drafted += T - 1;
     stats.accepted += c.n_acc;
+    p_->pool_check();
+    host_prof.lap(3);
     return c.n_out;
 }
 
 int MKEngine::max_batch_rows() { return MK_TP > 1 ? MAXR : MAXT; }
 
-void MKEngine::step_batch(const std::vector<int> & slots, std::vector<std::vector<int>> & outs) {
-    const int nb = (int) slots.size();
+void MKEngine::step_batch(const std::vector<int> & ids, std::vector<std::vector<int>> & outs) {
+    const int nb = (int) ids.size();
     outs.resize(nb);
     if (nb == 0) return;
     for (int b = 0; b < nb; b++) {
-        if (slots[b] < 0 || slots[b] >= p_->nseq) throw std::runtime_error("step_batch: no sequence slot " + std::to_string(slots[b]));
+        if (!p_->seqs.count(ids[b])) throw std::runtime_error("step_batch: no open sequence " + std::to_string(ids[b]));
         for (int k = 0; k < b; k++)
-            if (slots[k] == slots[b]) throw std::runtime_error("step_batch: slot listed twice");
+            if (ids[k] == ids[b]) throw std::runtime_error("step_batch: sequence listed twice");
     }
+    host_prof.start();
+    {
+        // every sequence's blocks before any of them steps: a short pool leaves all of them as they were
+        std::vector<KvCache<Ctl>::Req> rs;
+        for (int b = 0; b < nb; b++) {
+            Impl::Seq & q = p_->seqs.at(ids[b]);
+            const Ctl & c = q.hctl;
+            if ((int) q.seq.size() <= c.n)
+                throw std::runtime_error("step_batch: sequence " + std::to_string(ids[b]) + " has no pending token (prefill first)");
+            if (c.n + KV_AHEAD > p_->ctx) throw std::runtime_error("context full in sequence " + std::to_string(ids[b]));
+            rs.push_back({&q.blk, q.lane, std::min(c.dn_c, c.mtp_valid), c.n + KV_AHEAD});
+        }
+        p_->kc->ensure_all(rs);
+    }
+    host_prof.lap(0);
 #if MK_TP > 1
     const bool batched = nb > 1 && p_->nsm >= 54; // resid32_ks parks at most 3 items per block
 #else
@@ -4465,10 +4819,12 @@ void MKEngine::step_batch(const std::vector<int> & slots, std::vector<std::vecto
     if (!batched) {
         const int cur = p_->cur;
         for (int b = 0; b < nb; b++) {
-            if (slots[b] != p_->cur) p_->select(slots[b]);
+            select(ids[b]);
             step(outs[b]);
         }
-        if (cur != p_->cur) p_->select(cur);
+        p_->cur = cur;
+        if (cur >= 0) p_->focus();
+        p_->pool_check();
         return;
     }
 #if MK_TP > 1
@@ -4487,8 +4843,7 @@ void MKEngine::step_batch(const std::vector<int> & slots, std::vector<std::vecto
     std::vector<int> T(nb), nd(nb, 0), want(nb);
     int tot = 0;
     for (int b = 0; b < nb; b++) {
-        const Impl::SeqHost & q = p_->sh[slots[b]];
-        if (q.hctl.n + MAXT + 2 >= p_->ctx) throw std::runtime_error("context full in slot " + std::to_string(slots[b]));
+        const Impl::Seq & q = p_->seqs.at(ids[b]);
         T[b] = std::min(1 + q.nd_avail, MAXT);
         tot += T[b];
         want[b] = std::min((!q.all_acc && n_draft_ > 3) ? n_draft_ - 1 : n_draft_, MAXT - 1);
@@ -4510,21 +4865,23 @@ void MKEngine::step_batch(const std::vector<int> & slots, std::vector<std::vecto
     p_->row_rot++;
     P.nr = 0;
     for (int b = 0; b < nb; b++) {
-        Impl::SeqHost & q = p_->sh[slots[b]];
+        Impl::Seq & q = p_->seqs.at(ids[b]);
         P.Tb = std::max(P.Tb, T[b]);
         P.r0[b] = P.nr;
         P.nr += T[b];
         q.ndraft = nd[b];
-        P.slot[b] = slots[b];
+        P.slot[b] = q.lane;
         P.mtp_on[b] = n_draft_ > 0;
         P.sp[b] = Launch{MODE_DECODE, T[b], 0, q.ndraft, 0, q.smp_temp, q.smp_top_p, q.smp_min_p, q.smp_top_k, q.smp_seed,
                          p_->draft_prob};
     }
     p_->launch_batch(P);
+    host_prof.lap(1);
     for (int b = 0; b < nb; b++) {
-        Impl::SeqHost & q = p_->sh[slots[b]];
+        Impl::Seq & q = p_->seqs.at(ids[b]);
         Ctl & c = q.hctl;
-        p_->get_ctl_slot(slots[b], c);
+        p_->get_ctl_slot(q.lane, c);
+        if (b == 0) host_prof.lap(2);
         q.nd_avail = q.ndraft;
         outs[b].insert(outs[b].end(), c.out, c.out + c.n_out);
         q.seq.insert(q.seq.end(), c.out, c.out + c.n_out);
@@ -4535,13 +4892,15 @@ void MKEngine::step_batch(const std::vector<int> & slots, std::vector<std::vecto
     }
     stats.cycles++;
     CK(cudaGetLastError());
+    p_->pool_check();
+    host_prof.lap(3);
 #endif
 }
 
 std::vector<float> MKEngine::last_hidden() {
+    Impl::Seq & q = p_->need();
     std::vector<float> h(D);
-    const int pos = p_->S().hctl.dn_c - 1;
-    p_->use();
+    const int pos = q.hctl.dn_c - 1;
     CK(cudaMemcpy(h.data(), p_->sb().h_hist + (size_t) (pos % H_RING) * D, D * 4, cudaMemcpyDeviceToHost));
     return h;
 }
