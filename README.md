@@ -4,11 +4,12 @@
 
 | two RTX 3090s power-limited to 280 W (stock 350 W), coding prompt, greedy | Q4_K_M | Q8_0 |
 |---|---|---|
-| 1 request | **190 tok/s** | 144 tok/s |
-| 8 parallel requests (total) | **625 tok/s** | 610 tok/s |
+| 1 request | **190 tok/s** | 143 tok/s |
+| 8 parallel requests (total) | **622 tok/s** | 610 tok/s |
 
 - 1.64x llama.cpp's fastest two-GPU setup, same output quality ([Results](#results), [Quality](#quality)).
-- Up to 8 requests decoded together in one cycle ([Parallel requests](#parallel-requests)).
+- Up to 8 requests decoded together in one cycle, sharing one KV pool with a prefix cache ([Parallel requests](#parallel-requests)).
+- Shared KV pool: one long request next to several short ones, cached system prompts and conversations, the newest request pauses when the pool is full ([Shared KV pool](#shared-kv-pool-and-prefix-cache)).
 - Plain PCIe, no NVLink. Q4_K / Q5_K / Q6_K / Q8_0 weights in any per-tensor mix.
 - OpenAI-compatible server.
 
@@ -27,11 +28,11 @@ Built on L-Forster's single-GPU megakernel from [open-jet](https://github.com/L-
 
 ### Prebuilt (RTX 30)
 
-[Releases](https://github.com/ohgeebtw/geezuz-qwen3.8-27b-dual-gpu/releases) has `geezuz-v0.2.0-sm_86.tar.gz` for RTX 30 cards (sm_86): the one-GPU and two-GPU CLI and server libraries, libllama for the tokenizer, the server and the draft vocabulary. It needs Linux x86-64 with glibc 2.35+ (Ubuntu 22.04 or newer), NVIDIA driver 575.57+, Python 3 with `jinja2` for the server, and P2P for two GPUs (see [Two GPUs](#two-gpus)).
+[Releases](https://github.com/ohgeebtw/geezuz-qwen3.8-27b-dual-gpu/releases) has `geezuz-v0.3.0-sm_86.tar.gz` for RTX 30 cards (sm_86): the one-GPU and two-GPU CLI and server libraries, libllama for the tokenizer, the server and the draft vocabulary. It needs Linux x86-64 with glibc 2.35+ (Ubuntu 22.04 or newer), NVIDIA driver 575.57+, Python 3 with `jinja2` for the server, and P2P for two GPUs (see [Two GPUs](#two-gpus)).
 
 ```sh
-sha256sum -c geezuz-v0.2.0-sm_86.tar.gz.sha256
-tar xzf geezuz-v0.2.0-sm_86.tar.gz && cd geezuz-v0.2.0-sm_86
+sha256sum -c geezuz-v0.3.0-sm_86.tar.gz.sha256
+tar xzf geezuz-v0.3.0-sm_86.tar.gz && cd geezuz-v0.3.0-sm_86
 MK_DEVICES=0,1 ./geezuz_tp2 -m Qwen3.8-27B-Q4_K_M.gguf -p "Write quicksort in C" -n 512 -d 4 --draft-vocab draft_vocab_32k.bin
 python3 server/mk_server.py -m Qwen3.8-27B-Q4_K_M.gguf --lib ./libgeezuz_tp2.so -c 16384 --slots 8
 ```
@@ -346,7 +347,7 @@ llama-quantize Qwen3.8-27B-BF16-00001-of-00002.gguf Qwen3.8-27B-Q4_K_M.gguf Q4_K
 
 **More than two GPUs?** No, the split is written for exactly two.
 
-**Parallel requests?** Yes, up to 8 on two GPUs: 625 tok/s in total on Q4_K_M. A task split into 8 independent parts finishes about 3.4x faster than as one request. All slots share one KV pool, so a long request and several short ones fit together; when the pool runs full, the newest request pauses until room frees up.
+**Parallel requests?** Yes, up to 8 on two GPUs: 622 tok/s in total on Q4_K_M. A task split into 8 independent parts finishes about 3.4x faster than as one request. All slots share one KV pool, so a long request and several short ones fit together; when the pool runs full, the newest request pauses until room frees up.
 
 **Which quants?** Q4_K_M (unsloth) is tuned, benchmarked and checked for quality; batched decode is also tuned on Q8_0. Q5_K_M, Q6_K and UD-Q4_K_M load but are not tuned or checked. Q8_0 (28.7 GB) only fits on two cards.
 

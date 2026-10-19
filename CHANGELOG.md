@@ -1,8 +1,15 @@
 # Changelog
 
-## Unreleased: shared KV pool, prefix cache, preemption
+## v0.3.0: shared KV pool, prefix cache, preemption
 
 All requests now take their KV from one paged pool instead of a fixed share per slot, conversations and shared system prompts are cached across requests, and a full pool pauses the newest request instead of failing. Same VRAM, same quality, 0.1 to 0.6 % decode tok/s.
+
+### Build
+
+| build | change | Q4_K_M 1 req | Q4_K_M 8 req | Q8_0 1 req | Q8_0 8 req |
+|---|---|---|---|---|---|
+| za | v0.2.0 (fp16 KV, mean of 3 runs) | 190.9 | 625.7 | 143.5 | 611.3 |
+| zc | shared paged KV pool, prefix cache, preemption | 190.4 | 621.9 | 143.2 | 609.9 |
 
 ### What changed
 

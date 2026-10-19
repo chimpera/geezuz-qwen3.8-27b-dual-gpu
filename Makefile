@@ -8,7 +8,7 @@ LLAMA_BIN ?= $(LLAMA)/build/bin
 # binaries look for libllama next to themselves first (release tarball); a release build leaves out the build path
 RPATH = $(if $(RELEASE),$$ORIGIN,$$ORIGIN:$(abspath $(LLAMA_BIN)))
 LDLLAMA = -L$(LLAMA_BIN) -lllama -lggml-base -Xlinker -rpath -Xlinker '$(RPATH)'
-VERSION ?= v0.2.0
+VERSION ?= v0.3.0
 DIST = geezuz-$(VERSION)-$(ARCH)
 
 all: geezuz libgeezuz.so geezuz_tp2 libgeezuz_tp2.so tools/vocab_freq tools/llama_ref
