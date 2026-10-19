@@ -98,13 +98,16 @@ def mk_run(args, ctx):
 
 
 def main():
+    global MODEL
     ap = argparse.ArgumentParser()
     ap.add_argument("--ctx-sizes", default="0,4000,16000,30000,60000")
     ap.add_argument("--llama-configs", default="layer:2,layer:4,tensor:4")
     ap.add_argument("--reps", type=int, default=2)
     ap.add_argument("-n", type=int, default=256, help="tokens generated per context-sweep run")
     ap.add_argument("-c", "--ctx", type=int, default=64000, help="KV capacity of both engines")
+    ap.add_argument("--model", default=MODEL)
     args = ap.parse_args()
+    MODEL = args.model
     os.makedirs(TMP, exist_ok=True)
     sizes = [int(x) for x in args.ctx_sizes.split(",")]
     prompts = [l.strip() for l in open(os.path.join(HERE, "prompts.txt")) if l.strip()]
