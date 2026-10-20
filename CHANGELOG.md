@@ -1,15 +1,41 @@
 # Changelog
 
+## Builds
+
+Every build, total tok/s on two RTX 3090s: Q4_K_M and Q8_0, 1 and 8 parallel requests, coding prompt, 512 tokens each,
+greedy, `-d 4`. The newest build is the last row; what each one changed is under its version below.
+
+| build | version | change | Q4_K_M 1 req | Q4_K_M 8 req | Q8_0 1 req | Q8_0 8 req |
+|---|---|---|---|---|---|---|
+| h | v0.2.0 | Q8_0 tensor-core rows up to 32 (baseline) | | | 142 | 561 |
+| i | v0.2.0 | K-quants on dp4a, capped at 10 rows per cycle | 174 | 298 | | 560 |
+| k | v0.2.0 | K-quant tensor-core rows (16/32 by slot count), swizzled activation layout | 174 | 433 | | 500 |
+| l | v0.2.0 | K-quant weights in 16-row tiles | 163 | 506 | | 518 |
+| m | v0.2.0 | Q6_K whole-block path; FFN gate/up 4 rows per step | 180 | 513 | | 506 |
+| n | v0.2.0 | Q4_K/Q5_K whole-block path | 179 | 542 | | 509 |
+| o | v0.2.0 | bf16 exchange between the cards, only rows in use cross PCIe, one fence per block | 183 | 585 | 146 | 561 |
+| p | v0.2.0 | one GEMV instance per weight type (type checked once per phase) | 183 | 583 | 146 | 570 |
+| q | v0.2.0 | int8 exchange with a scale per 32 values | 182 | 603 | 139 | 587 |
+| r | v0.2.0 | 3 K-quant groups in flight in the residual GEMV: slower, reverted | 182 | 585 | 139 | 584 |
+| s/t | v0.2.0 | profiler step record; faster code generation, confirmed by a back-to-back drift check | 186 | 624 | 141 | 595 |
+| w | v0.2.0 | release store for the exchange flags without a full system fence | 190 | 627 | 144 | 599 |
+| y | v0.2.0 | projections: the two warps of a pair split each weight slice | | 621 | | 606 |
+| za | v0.2.0 | w + y | 190 | 625 | 144 | 610 |
+| zc | v0.3.0 | shared paged KV pool, prefix cache, preemption | **190** | **622** | **143** | **610** |
+
+## v0.3.1: running requests keep their speed, request ids, relocatable builds
+
+Server and build only; the kernel is build zc unchanged.
+
+- **Prefill no longer stalls running requests** (`--prefill-share`, `--prefill-chunk`): while others decode, prompts are prefilled in chunks of 512 tokens (was 2048, and one chunk for every waiting prompt per cycle) for at most a quarter of the time, so running requests keep about three quarters of their speed. The shortest remaining prompt goes first. With nothing decoding, prompts still go in whole.
+- **Shared prompts arriving together are prefilled once**: a request whose prompt shares a snapshot point (the end of the system message, the start of the last user message, the whole prompt) with a prompt still being prefilled waits for it, then starts from its snapshot instead of prefilling the same tokens again.
+- **Request ids**: the client's `X-Request-Id` or else the response id tags every server log line of a request, is echoed in the `X-Request-Id` response header and shows per slot in `/status`.
+- **`/status` `kv_pool`** adds `used_blocks` (held by running requests) and `updated`; it is read after every decode cycle.
+- **Relocatable builds**: `make` copies libllama and its ggml libraries next to the binaries and links every one of them directly with an `$ORIGIN` rpath, so a build directory or the release tarball runs from any path on any machine without `LD_LIBRARY_PATH` (libllama's own rpath points at the machine it was built on and is no longer searched).
+
 ## v0.3.0: shared KV pool, prefix cache, preemption
 
 All requests now take their KV from one paged pool instead of a fixed share per slot, conversations and shared system prompts are cached across requests, and a full pool pauses the newest request instead of failing. Same VRAM, same quality, 0.1 to 0.6 % decode tok/s.
-
-### Build
-
-| build | change | Q4_K_M 1 req | Q4_K_M 8 req | Q8_0 1 req | Q8_0 8 req |
-|---|---|---|---|---|---|
-| za | v0.2.0 (fp16 KV, mean of 3 runs) | 190.9 | 625.7 | 143.5 | 611.3 |
-| zc | shared paged KV pool, prefix cache, preemption | 190.4 | 621.9 | 143.2 | 609.9 |
 
 ### What changed
 
@@ -42,26 +68,7 @@ Greedy output after a pause, or in a different batch, continues correctly but is
 
 Two RTX 3090s, 8 parallel requests, total tok/s: **Q4_K_M 298 to 625 (2.1x)**, Q8_0 561 to 610. One request: Q4_K_M 190 tok/s, Q8_0 144.
 
-Every step below was found and checked with the per-phase profiler (`MK_PROFILE=batch`): time per phase per cycle, block arrival at each barrier, a "min-composed" estimate that filters out other GPU users, and a per-step record of block 0 (activation loads, compute, reduce, send, peer wait). Each build ran the same sweep (Q4_K_M and Q8_0, 1 to 8 parallel requests, coding prompt, 512 tokens each, greedy, `-d 4`).
-
-### Build by build
-
-| build | change | Q4_K_M 1 req | Q4_K_M 8 req | Q8_0 1 req | Q8_0 8 req |
-|---|---|---|---|---|---|
-| h | Q8_0 tensor-core rows up to 32 (baseline) | | | 142 | 561 |
-| i | K-quants on dp4a, capped at 10 rows per cycle | 174 | 298 | | 560 |
-| k | K-quant tensor-core rows (16/32 by slot count), swizzled activation layout | 174 | 433 | | 500 |
-| l | K-quant weights in 16-row tiles | 163 | 506 | | 518 |
-| m | Q6_K whole-block path; FFN gate/up 4 rows per step | 180 | 513 | | 506 |
-| n | Q4_K/Q5_K whole-block path | 179 | 542 | | 509 |
-| o | bf16 exchange between the cards, only rows in use cross PCIe, one fence per block | 183 | 585 | 146 | 561 |
-| p | one GEMV instance per weight type (type checked once per phase) | 183 | 583 | 146 | 570 |
-| q | int8 exchange with a scale per 32 values | 182 | 603 | 139 | 587 |
-| r | 3 K-quant groups in flight in the residual GEMV: slower, reverted | 182 | 585 | 139 | 584 |
-| s/t | profiler step record; faster code generation, confirmed by a back-to-back drift check | 186 | 624 | 141 | 595 |
-| w | release store for the exchange flags without a full system fence | 190 | 627 | 144 | 599 |
-| y | projections: the two warps of a pair split each weight slice | | 621 | | 606 |
-| za | w + y | **190** | **625** | **144** | **610** |
+Builds h to za ([Builds](#builds)) were found and checked with the per-phase profiler (`MK_PROFILE=batch`): time per phase per cycle, block arrival at each barrier, a "min-composed" estimate that filters out other GPU users, and a per-step record of block 0 (activation loads, compute, reduce, send, peer wait). Each build ran the same sweep (Q4_K_M and Q8_0, 1 to 8 parallel requests, coding prompt, 512 tokens each, greedy, `-d 4`).
 
 Time per cycle at 8 requests, Q4_K_M: 62.5 ms (k) to 42.7 ms (za). Build i was fast per cycle (33 ms) but carried at most 10 rows, so it could not batch more than about 2 requests' drafts.
 

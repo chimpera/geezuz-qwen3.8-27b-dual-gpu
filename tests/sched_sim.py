@@ -144,19 +144,25 @@ def run(seed, nblocks, slots, njobs, ctx=2048):
     SLOTS = slots
     rng = random.Random(seed)
     srv = object.__new__(mk.Server)
-    srv.args = types.SimpleNamespace(slots=slots, prefill_chunk=64, ctx=ctx, think_budget=0)
+    srv.args = types.SimpleNamespace(slots=slots, prefill_chunk=64, prefill_share=rng.choice([0.25, 1.0]), ctx=ctx,
+                                     think_budget=0)
     srv.eng = FakeEng(nblocks, ctx, rng)
     srv.warned = set(); srv.queue = queue.Queue(); srv.waiting = collections.deque()
-    srv.pool = srv.eng.pool_stats(); srv.kv_ahead = KV_AHEAD; srv.active = {}
+    srv.pool = srv.pool_stats(); srv.prefill_owed = 0.0; srv.kv_ahead = KV_AHEAD; srv.active = {}
     srv.admissions = 0; srv.preempted = 0; srv.think_stop_n = len(THINK_TOKS)
     srv.slot_status = [{"slot": s, "busy": False, "phase": "idle", "action": None, "updated": 0} for s in range(slots)]
     srv.last = None
     jobs = []
+    system = [rng.randrange(1, 800) for _ in range(rng.randint(20, 200))]  # a prefix some prompts share
     for k in range(njobs):
         toks = [rng.randrange(1, 800) for _ in range(rng.randint(5, 400))]
+        shared = rng.random() < 0.4
+        if shared:
+            toks = system + toks
         max_new = min(rng.randint(50, 1200), ctx - len(toks) - 16)
         budget = rng.choice([0, 0, 100, 300])
         job = mk.Job({"temperature": 0}, toks, budget > 0, max_new, budget)
+        job.snaps = [len(system)] if shared else []
         job.cancelled = rng.random() < 0.05
         jobs.append(job); srv.queue.put(job)
     # drive run() manually: copy of the loop body with an iteration bound

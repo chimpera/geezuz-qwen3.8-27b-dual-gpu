@@ -12,15 +12,20 @@ prefixes across requests and conversations (the engine's prefix cache in the KV 
 the longest cached prefix with a stored DeltaNet state (a finished request's end, the state before a prompt's
 last token, the end of a leading system message and the start of the last user message) and only the rest is
 prefilled; usage.prompt_tokens_details.cached_tokens reports the reused tokens.
-GET /health, GET /v1/models.  --slots N decodes up to N requests at once; more wait for a free slot.  A prompt is
-prefilled between decode cycles, in chunks while others decode.  The requests share one KV pool (--kv-mem) with the
-prefix cache: a request is admitted when the free blocks plus the cached ones the engine can evict (least
-recently used first) cover its prompt and a little growth.  When the pool runs full anyway, the most recently
-admitted request is preempted: its sequence stays cached, it waits at the head of the queue and resumes by
+GET /health, GET /v1/models. --slots N decodes up to N requests at once; more wait for a free slot. A prompt is
+prefilled between decode cycles; while others decode it goes in chunks (--prefill-chunk), shortest remaining prompt
+first, for a share of the time (--prefill-share), so running requests keep the rest of their speed. A prompt that
+shares a snapshot point (e.g. the system message) with a prompt still being prefilled waits for it and starts from
+its snapshot. Every log line of a request carries its id: the client's X-Request-Id (letters, digits, ._:-, at most
+128) or else the response id; the response echoes it in an X-Request-Id header. The requests share one KV pool
+(--kv-mem) with the prefix cache: a request is admitted when the free blocks plus the cached ones the engine can
+evict (least recently used first) cover its prompt and a little growth. When the pool runs full anyway, the most
+recently admitted request is preempted: its sequence stays cached, it waits at the head of the queue and resumes by
 prefilling its prompt plus what it generated (mostly cached), its stream continuing seamlessly; a request running
 alone that cannot grow ends with finish_reason "length".
-GET /status: what the engine is doing now (phase, live token count, tail of the reasoning / text / tool call
-being generated, per slot under `slots`), the KV pool (`kv_pool`), preemptions (`preempted`, per slot `preempts`)
+GET /status: what the engine is doing now (phase, live token count, tail of the reasoning / text / tool call being
+generated, per slot under `slots` with the request `id`), the KV pool (`kv_pool`, read after every decode cycle;
+`used_blocks` = held by running requests, `updated` = read time), preemptions (`preempted`, per slot `preempts`)
 and the stats of the last finished request.
 """
 import argparse
@@ -350,8 +355,10 @@ class OutputParser:
 class Job:
     """one chat completion; the scheduler thread runs it, the handler thread reads its events"""
 
-    def __init__(self, body, toks, thinking, max_new, budget):
+    def __init__(self, body, toks, thinking, max_new, budget, rid=None):
         self.body, self.toks, self.max_new, self.budget = body, toks, max_new, budget
+        self.cid = "chatcmpl-" + uuid.uuid4().hex  # the response id
+        self.rid = rid or self.cid  # the client's X-Request-Id or the response id: in every log line and echoed
         self.tools = body.get("tools") or []
         self.parser = OutputParser(thinking, self.tools)
         self.dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
@@ -368,6 +375,7 @@ class Job:
         self.admitted = 0  # admission order stamp (0: never admitted); the latest admitted job is preempted first
         self.preempts = 0  # times it left for a full KV pool and resumed by recompute
         self.held = 0  # KV blocks it held when last preempted (most stay cached: not room it can count on)
+        self.holding = False  # waits for another prompt to prefill their shared prefix (logged once)
         self.seed = None  # sampling seed, fixed at the first admission
         self.decoding = False  # its first token is out (a resume continues the stream and the decode timing)
         self.t0 = self.t1 = time.time()
@@ -401,7 +409,8 @@ class Server:
         self.warned = set()
         self.queue = queue.Queue()
         self.waiting = collections.deque()  # jobs not admitted yet for lack of a slot or KV blocks, in arrival order
-        self.pool = self.eng.pool_stats()  # refreshed by the scheduler thread; the engine is not read from handlers
+        self.pool = self.pool_stats()  # refreshed by the scheduler thread; the engine is not read from handlers
+        self.prefill_owed = 0.0  # decode seconds owed to running requests before the next prompt chunk
         self.kv_ahead = self.eng.kv_ahead()
         self.im_start = self.eng.tokenize("<|im_start|>")
         self.think_stop_n = len(self.eng.tokenize(THINK_STOP))
@@ -454,7 +463,7 @@ class Server:
         thinking = text.endswith("<think>\n")
         return text, thinking
 
-    def prepare(self, body):
+    def prepare(self, body, rid=None):
         """handler side: renders and tokenizes the request (BadRequest before anything is streamed)"""
         text, thinking = self.render(body)
         toks = self.eng.tokenize(text)
@@ -467,7 +476,7 @@ class Server:
         if limit <= 0:
             raise BadRequest(f"prompt of {len(toks)} tokens does not fit the context of {self.args.ctx}")
         max_new = limit if max_new <= 0 else min(max_new, limit)
-        job = Job(body, toks, thinking, max_new, budget)
+        job = Job(body, toks, thinking, max_new, budget, rid)
         job.snaps = self.snap_hints(toks)
         return job
 
@@ -557,6 +566,7 @@ class Server:
     def schedule(self):
         """one scheduler pass: admissions, prompt feeding, one decode cycle"""
         # in arrival order, while a slot is free and the KV pool covers the job's feed (alone it always fits)
+        held = []
         while len(self.active) < self.args.slots:
             if not self.waiting:
                 try:
@@ -564,15 +574,36 @@ class Server:
                 except queue.Empty:
                     break
             job = self.waiting[0]
+            if not job.cancelled and self.held(job):
+                held.append(self.waiting.popleft())
+                continue
             if self.active and not job.cancelled and not self.fits(job):
                 break
             self.admit(self.waiting.popleft())
+        self.waiting.extendleft(reversed(held))
         filling = [j for j in self.active.values() if j.fed < len(j.feed)]
-        decoding = len(self.active) > len(filling)
-        for job in filling:
-            self.prefill(job, decoding)
+        if len(filling) == len(self.active):  # nothing decodes: the prompts go in whole
+            for job in filling:
+                self.prefill(job)
+        elif filling and self.prefill_owed <= 0:
+            # one chunk's worth, shortest remaining prompts first (short prompts arriving together start together), then
+            # decode cycles until the decoders got their share back
+            budget = self.args.prefill_chunk
+            t = time.time()
+            for job in sorted(filling, key=lambda j: (len(j.feed) - j.fed, j.admitted)):
+                rest = len(job.feed) - job.fed
+                if rest > budget and budget < self.args.prefill_chunk:
+                    break
+                self.prefill(job, budget)
+                budget -= rest
+                if budget <= 0:
+                    break
+            share = self.args.prefill_share
+            self.prefill_owed += (time.time() - t) * (1 - share) / share
+        t = time.time()
         self.cycle()
-        self.pool = self.eng.pool_stats()
+        self.prefill_owed = max(0.0, self.prefill_owed - (time.time() - t))
+        self.pool = self.pool_stats()
 
     def admit(self, job):
         """opens the job's sequence from the longest cached prefix; the rest of its feed is prefilled by prefill()"""
@@ -587,7 +618,7 @@ class Server:
         if first:
             job.t0 = time.time()
         # every field, so a resume on another seat shows none of its previous job's
-        self.track(s, busy=True, phase="prefill" if first else "resume", gen=job.n_gen,
+        self.track(s, busy=True, id=job.rid, phase="prefill" if first else "resume", gen=job.n_gen,
                    tok_s=self.rate(job.n_gen, time.time() - job.t1) if job.decoding else 0.0, ctx=len(job.toks),
                    started=job.t0, prefill_s=job.t1 - job.t0 if job.decoding else None,
                    prefill_n=len(job.toks) - job.reused if job.decoding else None, prefilled=None, preempts=job.preempts)
@@ -596,15 +627,35 @@ class Server:
             if first:
                 job.reused = job.fed
             self.sampling(job)
-            log(f"slot {s}: {'prompt' if first else 'resume'} {len(job.feed)} tok, {job.fed} cached")
+            log(f"slot {s} [{job.rid}]: {'prompt' if first else 'resume'} {len(job.feed)} tok, {job.fed} cached")
         except Exception as e:
             self.fail(job, e)
+
+    def held(self, job):
+        """a prompt that shares a snapshot point with a prompt still being prefilled waits until that point is
+        prefilled, then starts from its snapshot instead of prefilling the shared part a second time"""
+        for other in self.active.values():
+            if other.fed >= len(other.feed):
+                continue
+            for h in [*other.snaps, len(other.feed) - 1]:
+                if other.fed < h < len(job.feed) and job.feed[:h] == other.feed[:h]:
+                    if not job.holding:
+                        job.holding = True
+                        log(f"[{job.rid}]: waits for the shared prefix of {h} tok being prefilled in slot {other.slot}")
+                    return True
+        return False
+
+    def pool_stats(self):
+        """the engine's pool counts plus the blocks running requests hold and when they were read"""
+        p = self.eng.pool_stats()
+        used = p["total_blocks"] - p["free_blocks"] - p["evictable_blocks"]
+        return {**p, "used_blocks": used, "updated": time.time()}
 
     def fits(self, job):
         """optimistic admission: free blocks plus the cached ones the engine can evict cover the job's feed, one
         cycle's lookahead and one block of growth per running job.  A preempted job does not count the blocks it
         left cached: re-admitting it by evicting its own prefix would only preempt it again."""
-        self.pool = self.eng.pool_stats()
+        self.pool = self.pool_stats()
         avail = self.pool["free_blocks"] + self.pool["evictable_blocks"] - job.held
         need = -(-(len(job.feed) + self.kv_ahead) // self.pool["block_tokens"]) + len(self.active)
         return need <= avail
@@ -629,8 +680,8 @@ class Server:
         self.preempted += 1
         self.track(s, busy=False, phase="idle")
         self.waiting.appendleft(job)
-        log(f"slot {s}: KV pool full, preempted after {job.n_gen} tok (preemption {job.preempts}, {len(job.feed)} tok to "
-            f"resume, {len(self.waiting)} waiting)")
+        log(f"slot {s} [{job.rid}]: KV pool full, preempted after {job.n_gen} tok (preemption {job.preempts}, "
+            f"{len(job.feed)} tok to resume, {len(self.waiting)} waiting)")
 
     def grow(self, job, call):
         """runs an engine call that grows job's sequence; on a full pool (cached blocks already evicted) preempts the
@@ -646,17 +697,17 @@ class Server:
                 if victim is job:
                     return None
 
-    def prefill(self, job, chunked):
-        """feeds the job's feed, one chunk of it while other jobs are decoding (they stall one chunk at most)"""
+    def prefill(self, job, chunk=None):
+        """feeds the job's feed, at most chunk tokens of it while other jobs are decoding (they stall one chunk at most)"""
         if self.active.get(job.slot) is not job:  # preempted earlier in this loop
             return
         try:
             rest = job.feed[job.fed:]
-            if chunked and len(rest) > self.args.prefill_chunk:
+            if chunk is not None and len(rest) > chunk:
                 # an intermediate chunk ends with a generated token, which the next chunk's position overwrites
-                if self.grow(job, lambda: self.eng.append(job.seq, rest[:self.args.prefill_chunk], job.snaps)) is None:
+                if self.grow(job, lambda: self.eng.append(job.seq, rest[:chunk], job.snaps)) is None:
                     return
-                job.fed += self.args.prefill_chunk
+                job.fed += chunk
                 self.eng.truncate(job.seq, job.fed)
                 self.track(job.slot, prefilled=job.fed)
                 return
@@ -704,7 +755,7 @@ class Server:
                     continue
                 for kind, delta in job.parser.feed(THINK_STOP):
                     job.show(kind, delta)
-                log(f"slot {s}: thinking budget of {job.budget} tokens reached")
+                log(f"slot {s} [{job.rid}]: thinking budget of {job.budget} tokens reached")
                 job.budget, job.stopped = 0, True
                 self.consume(job, [tok])
             else:
@@ -718,7 +769,7 @@ class Server:
                 self.fail(job, e)
                 continue
             if full:
-                log(f"slot {s}: context full, finishing after {job.n_gen} tok")
+                log(f"slot {s} [{job.rid}]: context full, finishing after {job.n_gen} tok")
                 job.finish = "length"
                 self.complete(job)
         stepping = [s for s in stepping if s in self.active]
@@ -748,7 +799,7 @@ class Server:
 
     def out_of_pool(self, job):
         """the job runs alone and still cannot grow: it ends as if max_tokens were reached"""
-        log(f"slot {job.slot}: KV pool full with no other job to preempt, finishing after {job.n_gen} tok")
+        log(f"slot {job.slot} [{job.rid}]: KV pool full with no other job to preempt, finishing after {job.n_gen} tok")
         job.finish = "length"
         self.complete(job)
 
@@ -774,7 +825,7 @@ class Server:
                     self.eng.truncate(job.seq, self.eng.seq_len(job.seq) - (len(toks) - 1 - k))
                     break
                 except Exception as e:
-                    log(f"slot {job.slot}: think stop after the cycle's last token:", repr(e))
+                    log(f"slot {job.slot} [{job.rid}]: think stop after the cycle's last token:", repr(e))
         if time.time() - job.shown >= 0.25:
             job.shown = time.time()
             self.track(job.slot, **self.live(job, job.shown - job.t1))
@@ -788,11 +839,11 @@ class Server:
             try:
                 self.eng.seq_close(job.seq, keep=True)
             except Exception as e:
-                log("close failed:", repr(e))
+                log(f"slot {job.slot} [{job.rid}]: close failed:", repr(e))
                 try:
                     self.eng.seq_close(job.seq, keep=False)
                 except Exception as e2:
-                    log("close without caching failed:", repr(e2))
+                    log(f"slot {job.slot} [{job.rid}]: close without caching failed:", repr(e2))
             job.seq = None
 
     def complete(self, job):
@@ -804,8 +855,8 @@ class Server:
         t2 = time.time()
         n_gen, n_prompt = job.n_gen, len(job.toks)
         end = "cancelled" if job.cancelled else job.finish
-        log(f"slot {job.slot}: prompt {n_prompt} tok ({job.reused} reused) in {job.t1 - job.t0:.2f} s, {n_gen} tok "
-            f"in {t2 - job.t1:.2f} s ({self.rate(n_gen, t2 - job.t1):.1f} tok/s), "
+        log(f"slot {job.slot} [{job.rid}]: prompt {n_prompt} tok ({job.reused} reused) in {job.t1 - job.t0:.2f} s, "
+            f"{n_gen} tok in {t2 - job.t1:.2f} s ({self.rate(n_gen, t2 - job.t1):.1f} tok/s), "
             f"{end}" + (f", preempted {job.preempts}x" if job.preempts else ""))
         usage = {"prompt_tokens": n_prompt, "completion_tokens": n_gen, "total_tokens": n_prompt + n_gen,
                  "prompt_tokens_details": {"cached_tokens": job.reused}}
@@ -818,7 +869,8 @@ class Server:
                  "arguments": {k: v[:STATUS_TAIL] if isinstance(v, str) else v
                                for k, v in json.loads(c["function"]["arguments"]).items()}} for c in calls]}
         if n_gen > 1:  # a 1-token request (warm-up, title) has no decode speed: keep the last real job's figures
-            self.last = {"slot": job.slot, "tok_s": timings["predicted_per_second"], "gen": n_gen, "ctx": n_prompt,
+            self.last = {"slot": job.slot, "id": job.rid, "tok_s": timings["predicted_per_second"], "gen": n_gen,
+                         "ctx": n_prompt,
                          "reused": job.reused, "prefill_s": job.t1 - job.t0, "finish": end, "preempts": job.preempts,
                          "at": t2}
         self.track(job.slot, busy=False, phase="idle", action=action)
@@ -827,14 +879,14 @@ class Server:
 
     def fail(self, job, e):
         """engine error: the job reports it, its sequence is dropped (what other holders share stays cached)"""
-        log(f"slot {job.slot} error:", repr(e))
+        log(f"slot {job.slot} [{job.rid}] error:", repr(e))
         s = job.slot
         self.active.pop(s, None)
         if job.seq is not None:
             try:
                 self.eng.seq_close(job.seq, keep=False)
             except Exception as e2:
-                log("closing the sequence after an error failed:", repr(e2))
+                log(f"slot {s} [{job.rid}]: closing the sequence after an error failed:", repr(e2))
             job.seq = None
         self.track(s, busy=False, phase="idle")
         job.events.put(("error", e))
@@ -847,10 +899,12 @@ def make_handler(srv):
         def log_message(self, *a):
             pass
 
-        def _json(self, code, obj):
+        def _json(self, code, obj, rid=None):
             data = json.dumps(obj).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
+            if rid:
+                self.send_header("X-Request-Id", rid)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -881,10 +935,13 @@ def make_handler(srv):
             except json.JSONDecodeError:
                 self._json(400, {"error": {"message": "invalid JSON", "type": "invalid_request_error"}})
                 return
+            # only a plain token is taken: it is logged and echoed in a header
+            rid = self.headers.get("X-Request-Id", "").strip()
+            rid = rid if re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", rid) else None
             try:
-                job = srv.prepare(body)
+                job = srv.prepare(body, rid)
             except BadRequest as e:
-                self._json(400, {"error": {"message": str(e), "type": "invalid_request_error"}})
+                self._json(400, {"error": {"message": str(e), "type": "invalid_request_error"}}, rid)
                 return
             srv.submit(job)
             try:
@@ -896,7 +953,7 @@ def make_handler(srv):
                 job.cancelled = True
             except Exception as e:  # engine failure: report it, keep serving
                 try:
-                    self._json(500, {"error": {"message": str(e), "type": "server_error"}})
+                    self._json(500, {"error": {"message": str(e), "type": "server_error"}}, job.rid)
                 except Exception:
                     pass
 
@@ -908,12 +965,12 @@ def make_handler(srv):
                 msg["reasoning_content"] = "".join(parts["reasoning"]).strip()
             if calls:
                 msg["tool_calls"] = calls
-            self._json(200, {"id": "chatcmpl-" + uuid.uuid4().hex, "object": "chat.completion", "created": int(time.time()),
+            self._json(200, {"id": job.cid, "object": "chat.completion", "created": int(time.time()),
                              "model": srv.model_id, "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
-                             "usage": usage, "timings": timings})
+                             "usage": usage, "timings": timings}, job.rid)
 
         def _stream(self, job):
-            cid, created = "chatcmpl-" + uuid.uuid4().hex, int(time.time())
+            cid, created = job.cid, int(time.time())
             started = [False]
 
             def chunk(delta, finish=None, usage=None, timings=None):
@@ -934,6 +991,7 @@ def make_handler(srv):
                     self.send_header("Content-Type", "text/event-stream")
                     self.send_header("Cache-Control", "no-cache")
                     self.send_header("Transfer-Encoding", "chunked")
+                    self.send_header("X-Request-Id", job.rid)
                     self.end_headers()
                     chunk({"role": "assistant", "content": None})
 
@@ -977,12 +1035,17 @@ def main():
     ap.add_argument("--slots", type=int, default=1,
                     help="requests decoded at once (1..8), their KV taken from the shared pool as they grow; with the "
                          "TP2 library they share one batched cycle")
-    ap.add_argument("--prefill-chunk", type=int, default=2048,
-                    help="prompt tokens fed per step while other requests decode (they stall one chunk at most)")
+    ap.add_argument("--prefill-chunk", type=int, default=512,
+                    help="prompt tokens fed at a time while other requests decode (they stall one chunk at most)")
+    ap.add_argument("--prefill-share", type=float, default=0.25,
+                    help="share of the time prompts are prefilled while other requests decode (0..1]: the decoders "
+                         "keep the rest of their speed, a prompt takes 1/share times as long")
     ap.add_argument("--think-budget", type=int, default=0,
                     help="reasoning tokens per request before </think> is forced (0: unlimited); "
                          "a request's thinking_budget overrides it")
     args = ap.parse_args()
+    if not 0 < args.prefill_share <= 1:
+        ap.error("--prefill-share must be in (0, 1]")
     srv = Server(args)
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(srv))
     httpd.daemon_threads = True

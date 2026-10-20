@@ -28,11 +28,11 @@ Built on L-Forster's single-GPU megakernel from [open-jet](https://github.com/L-
 
 ### Prebuilt (RTX 30)
 
-[Releases](https://github.com/ohgeebtw/geezuz-qwen3.8-27b-dual-gpu/releases) has `geezuz-v0.3.0-sm_86.tar.gz` for RTX 30 cards (sm_86): the one-GPU and two-GPU CLI and server libraries, libllama for the tokenizer, the server and the draft vocabulary. It needs Linux x86-64 with glibc 2.35+ (Ubuntu 22.04 or newer), NVIDIA driver 575.57+, Python 3 with `jinja2` for the server, and P2P for two GPUs (see [Two GPUs](#two-gpus)).
+[Releases](https://github.com/ohgeebtw/geezuz-qwen3.8-27b-dual-gpu/releases) has `geezuz-v0.3.1-sm_86.tar.gz` for RTX 30 cards (sm_86): the one-GPU and two-GPU CLI and server libraries, libllama for the tokenizer, the server and the draft vocabulary. It needs Linux x86-64 with glibc 2.35+ (Ubuntu 22.04 or newer), NVIDIA driver 575.57+, Python 3 with `jinja2` for the server, and P2P for two GPUs (see [Two GPUs](#two-gpus)).
 
 ```sh
-sha256sum -c geezuz-v0.3.0-sm_86.tar.gz.sha256
-tar xzf geezuz-v0.3.0-sm_86.tar.gz && cd geezuz-v0.3.0-sm_86
+sha256sum -c geezuz-v0.3.1-sm_86.tar.gz.sha256
+tar xzf geezuz-v0.3.1-sm_86.tar.gz && cd geezuz-v0.3.1-sm_86
 MK_DEVICES=0,1 ./geezuz_tp2 -m Qwen3.8-27B-Q4_K_M.gguf -p "Write quicksort in C" -n 512 -d 4 --draft-vocab draft_vocab_32k.bin
 python3 server/mk_server.py -m Qwen3.8-27B-Q4_K_M.gguf --lib ./libgeezuz_tp2.so -c 16384 --slots 8
 ```
@@ -55,6 +55,7 @@ cmake -S ../llama.cpp -B ../llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_S
 cmake --build ../llama.cpp/build -j
 
 make   # one-GPU and two-GPU CLI + server libraries, tools; ARCH=sm_89 overrides the detected GPU
+       # libllama and its ggml libraries are copied next to them: the directory runs from any path or machine
 
 # one GPU
 ./geezuz -m ../models/Qwen3.8-27B-Q4_K_M.gguf -p "Write quicksort in C" -n 512 -d 4 --draft-vocab draft_vocab_32k.bin
@@ -281,12 +282,16 @@ Prompts go through ordinary kernel launches (`prefill.cuh`) in chunks of up to 2
 | `--kv` | auto | KV cache: `f16`, `q8`, or `auto` (q8_0 only when the fp16 pool holds less than one `-c` request) |
 | `--kv-mem` | 0 | KV pool MB per card (0: the free memory after the slots and a reserve) |
 | `--slots` | 1 | requests decoded at once; more requests queue |
+| `--prefill-chunk` | 512 | prompt tokens fed at a time while other requests decode (they stall one chunk at most) |
+| `--prefill-share` | 0.25 | share of the time prompts are prefilled while other requests decode: those keep the rest of their speed, a prompt takes 1/share times as long |
 | `--think-budget` | 0 | reasoning tokens per request before `</think>` is forced (0: unlimited; a request's `thinking_budget` overrides it) |
 
 - Prompts use the chat template stored in the GGUF: `chat_template_kwargs` `enable_thinking` / `preserve_thinking` / `reasoning_effort`, OpenAI `tools`. Reasoning streams as `reasoning_content`; tool calls come back as `tool_calls`.
-- Follow-up requests of a conversation, and requests sharing a system prompt, only prefill what is not in the prefix cache.
+- Follow-up requests of a conversation, and requests sharing a system prompt, only prefill what is not in the prefix cache. Requests that arrive together with the same uncached system prompt prefill it once: the others wait until it is in, then start from its snapshot.
+- With nothing decoding, prompts are prefilled whole. While others decode, prompts go in `--prefill-chunk` chunks, shortest remaining prompt first, for `--prefill-share` of the time.
+- Request ids: a client's `X-Request-Id` header (letters, digits, `._:-`, up to 128) or else the response id (`chatcmpl-...`) tags every log line of the request (`slot N [id]: ...`: admission, cache hit, preemption, thinking budget, finish, errors), is echoed in the response's `X-Request-Id` header and shows as `id` per slot in `/status`.
 - Sampling: temperature, top_p, top_k (<= 32), min_p, seed. Presence / repetition penalties are ignored (with a warning).
-- `GET /status` reports each slot (with its preemption count), `kv_pool` (free, total, cached and evictable blocks, tokens per block) and `preempted`; `/props` reports `total_slots`.
+- `GET /status` reports each slot (with its request `id` and preemption count), `kv_pool` (free, total, cached, evictable and `used_blocks` held by running requests, tokens per block, `updated`: read after every decode cycle) and `preempted`; `/props` reports `total_slots`.
 
 open-jet uses this server in place of `llama-server` (`openjet setup` builds the one-GPU engine).
 
